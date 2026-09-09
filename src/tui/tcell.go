@@ -5,6 +5,7 @@ package tui
 import (
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -53,6 +54,7 @@ type TcellWindow struct {
 	showCursor    bool
 	wrapSign      string
 	wrapSignWidth int
+	tabstop       int
 }
 
 func (w *TcellWindow) Top() int {
@@ -246,7 +248,7 @@ func (r *FullscreenRenderer) Size() TermSize {
 	return TermSize{lines, cols, 0, 0}
 }
 
-func (r *FullscreenRenderer) GetChar() Event {
+func (r *FullscreenRenderer) GetChar(cancellable bool) Event {
 	ev := _screen.PollEvent()
 	switch ev := ev.(type) {
 	case *tcell.EventPaste:
@@ -703,6 +705,10 @@ func (r *FullscreenRenderer) GetChar() Event {
 	return Event{Invalid, 0, nil}
 }
 
+func (r *FullscreenRenderer) CancelGetChar() {
+	// TODO
+}
+
 func (r *FullscreenRenderer) Pause(clear bool) {
 	if clear {
 		_screen.Suspend()
@@ -753,7 +759,8 @@ func (r *FullscreenRenderer) NewWindow(top int, left int, width int, height int,
 		height:      height,
 		normal:      normal,
 		borderStyle: borderStyle,
-		showCursor:  r.showCursor}
+		showCursor:  r.showCursor,
+		tabstop:     r.tabstop}
 	w.Erase()
 	return w
 }
@@ -821,6 +828,21 @@ func (w *TcellWindow) withUrl(style tcell.Style) tcell.Style {
 	return style
 }
 
+func underlineStyleFromAttr(a Attr) tcell.UnderlineStyle {
+	switch a.UnderlineStyle() {
+	case UlStyleDouble:
+		return tcell.UnderlineStyleDouble
+	case UlStyleCurly:
+		return tcell.UnderlineStyleCurly
+	case UlStyleDotted:
+		return tcell.UnderlineStyleDotted
+	case UlStyleDashed:
+		return tcell.UnderlineStyleDashed
+	default:
+		return tcell.UnderlineStyleSolid
+	}
+}
+
 func (w *TcellWindow) printString(text string, pair ColorPair) {
 	lx := 0
 	a := pair.Attr()
@@ -829,11 +851,18 @@ func (w *TcellWindow) printString(text string, pair ColorPair) {
 	if a&AttrClear == 0 {
 		style = style.
 			Reverse(a&Attr(tcell.AttrReverse) != 0).
-			Underline(a&Attr(tcell.AttrUnderline) != 0).
 			StrikeThrough(a&Attr(tcell.AttrStrikeThrough) != 0).
 			Italic(a&Attr(tcell.AttrItalic) != 0).
 			Blink(a&Attr(tcell.AttrBlink) != 0).
 			Dim(a&Attr(tcell.AttrDim) != 0)
+		if a&Attr(tcell.AttrUnderline) != 0 {
+			style = style.Underline(underlineStyleFromAttr(a))
+			if pair.Ul() != colDefault {
+				style = style.Underline(asTcellColor(pair.Ul()))
+			}
+		} else {
+			style = style.Underline(false)
+		}
 	}
 	style = w.withUrl(style)
 
@@ -868,10 +897,8 @@ func (w *TcellWindow) CPrint(pair ColorPair, text string) {
 	w.printString(text, pair)
 }
 
-func (w *TcellWindow) fillString(text string, pair ColorPair) FillReturn {
-	lx := 0
+func (w *TcellWindow) pairStyle(pair ColorPair) tcell.Style {
 	a := pair.Attr()
-
 	var style tcell.Style
 	if w.color {
 		style = pair.style()
@@ -883,64 +910,73 @@ func (w *TcellWindow) fillString(text string, pair ColorPair) FillReturn {
 		Bold(a&Attr(tcell.AttrBold) != 0 || a&BoldForce != 0).
 		Dim(a&Attr(tcell.AttrDim) != 0).
 		Reverse(a&Attr(tcell.AttrReverse) != 0).
-		Underline(a&Attr(tcell.AttrUnderline) != 0).
 		StrikeThrough(a&Attr(tcell.AttrStrikeThrough) != 0).
 		Italic(a&Attr(tcell.AttrItalic) != 0)
-	style = w.withUrl(style)
+	if a&Attr(tcell.AttrUnderline) != 0 {
+		style = style.Underline(underlineStyleFromAttr(a))
+		if pair.Ul() != colDefault {
+			style = style.Underline(asTcellColor(pair.Ul()))
+		}
+	} else {
+		style = style.Underline(false)
+	}
+	return w.withUrl(style)
+}
 
+func (w *TcellWindow) renderGraphemes(text string, style tcell.Style) {
 	gr := uniseg.NewGraphemes(text)
-Loop:
 	for gr.Next() {
 		st := style
 		rs := gr.Runes()
-		if len(rs) == 1 {
-			r := rs[0]
-			switch r {
-			case '\r':
-				st = style.Dim(true)
-				rs[0] = '␍'
-			case '\n':
-				w.lastY++
-				w.lastX = 0
-				lx = 0
-				continue Loop
-			}
+		if len(rs) == 1 && rs[0] == '\r' {
+			st = style.Dim(true)
+			rs[0] = '␍'
 		}
 
-		// word wrap:
-		xPos := w.left + w.lastX + lx
-		if xPos >= w.left+w.width {
-			w.lastY++
-			if w.lastY >= w.height {
-				return FillSuspend
-			}
-			w.lastX = 0
-			lx = 0
-			xPos = w.left
-			sign := w.wrapSign
-			if w.wrapSignWidth > w.width {
-				runes, _ := util.Truncate(sign, w.width)
-				sign = string(runes)
-			}
-			wgr := uniseg.NewGraphemes(sign)
-			for wgr.Next() {
-				rs := wgr.Runes()
-				_screen.SetContent(w.left+lx, w.top+w.lastY, rs[0], rs[1:], style.Dim(true))
-				lx += uniseg.StringWidth(string(rs))
-			}
-			xPos = w.left + lx
-		}
-
+		xPos := w.left + w.lastX
 		yPos := w.top + w.lastY
-		if yPos >= (w.top + w.height) {
-			return FillSuspend
+		if xPos < (w.left+w.width) && yPos < (w.top+w.height) {
+			_screen.SetContent(xPos, yPos, rs[0], rs[1:], st)
 		}
-
-		_screen.SetContent(xPos, yPos, rs[0], rs[1:], st)
-		lx += util.StringWidth(string(rs))
+		w.lastX += util.StringWidth(string(rs))
 	}
-	w.lastX += lx
-	if w.lastX == w.width {
+}
+
+func (w *TcellWindow) renderWrapSign(style tcell.Style) {
+	sign := w.wrapSign
+	if w.wrapSignWidth > w.width {
+		runes, _ := util.Truncate(sign, w.width)
+		sign = string(runes)
+	}
+	gr := uniseg.NewGraphemes(sign)
+	for gr.Next() {
+		rs := gr.Runes()
+		_screen.SetContent(w.left+w.lastX, w.top+w.lastY, rs[0], rs[1:], style.Dim(true))
+		w.lastX += uniseg.StringWidth(string(rs))
+	}
+}
+
+func (w *TcellWindow) fillString(text string, pair ColorPair) FillReturn {
+	style := w.pairStyle(pair)
+
+	for i, segment := range strings.Split(text, "\n") {
+		for j, wl := range WrapLine(segment, w.lastX, w.width, w.tabstop, w.wrapSignWidth) {
+			if i > 0 || j > 0 {
+				w.lastY++
+				if w.lastY >= w.height {
+					return FillSuspend
+				}
+				w.lastX = 0
+				if j > 0 {
+					w.renderWrapSign(style)
+				}
+			}
+			if w.lastX < w.width {
+				w.renderGraphemes(wl.Text, style)
+			}
+		}
+	}
+	if w.lastX >= w.width {
 		w.lastY++
 		w.lastX = 0
 		return FillNextLine
@@ -963,14 +999,14 @@ func (w *TcellWindow) LinkEnd() {
 	w.params = nil
 }
 
-func (w *TcellWindow) CFill(fg Color, bg Color, a Attr, str string) FillReturn {
+func (w *TcellWindow) CFill(fg Color, bg Color, ul Color, a Attr, str string) FillReturn {
 	if fg == colDefault {
 		fg = w.normal.Fg()
 	}
 	if bg == colDefault {
 		bg = w.normal.Bg()
 	}
-	return w.fillString(str, NewColorPair(fg, bg, a))
+	return w.fillString(str, NewColorPair(fg, bg, a).WithUl(ul))
 }
 
 func (w *TcellWindow) DrawBorder() {
@@ -979,6 +1015,115 @@ func (w *TcellWindow) DrawBorder() {
 
 func (w *TcellWindow) DrawHBorder() {
 	w.drawBorder(true)
+}
+
+// borderStyleFor returns the tcell.Style used to draw borders for `wt`, honoring
+// whether the window is rendering with colors.
+func (w *TcellWindow) borderStyleFor(wt WindowType) tcell.Style {
+	if !w.color {
+		return w.normal.style()
+	}
+	return BorderColor(wt).style()
+}
+
+// drawHLine fills row `y` with `line` between optional left/right caps.
+// A zero rune means "no cap"; caps are placed at the very edges of `w`.
+// tcell has an issue displaying two overlapping wide runes, so the line
+// stops before the cap position rather than overpainting.
+func (w *TcellWindow) drawHLine(y int, line, leftCap, rightCap rune, style tcell.Style) {
+	left := w.left
+	right := left + w.width
+	hw := runeWidth(line)
+	lw := 0
+	rw := 0
+	if leftCap != 0 {
+		lw = runeWidth(leftCap)
+	}
+	if rightCap != 0 {
+		rw = runeWidth(rightCap)
+	}
+	for x := left + lw; x <= right-rw-hw; x += hw {
+		_screen.SetContent(x, y, line, nil, style)
+	}
+	if leftCap != 0 {
+		_screen.SetContent(left, y, leftCap, nil, style)
+	}
+	if rightCap != 0 {
+		_screen.SetContent(right-rw, y, rightCap, nil, style)
+	}
+}
+
+func (w *TcellWindow) DrawHSeparator(row int, windowType WindowType, useBottom bool) {
+	if w.height == 0 {
+		return
+	}
+	shape := w.borderStyle.shape
+	if shape == BorderNone {
+		return
+	}
+	style := w.borderStyleFor(windowType)
+	line := w.borderStyle.top
+	if useBottom {
+		line = w.borderStyle.bottom
+	}
+	var leftCap, rightCap rune
+	if shape.HasLeft() {
+		leftCap = w.borderStyle.leftMid
+	}
+	if shape.HasRight() {
+		rightCap = w.borderStyle.rightMid
+	}
+	w.drawHLine(w.top+row, line, leftCap, rightCap, style)
+}
+
+func (w *TcellWindow) PaintSectionFrame(topContent, bottomContent int, windowType WindowType, edge SectionEdge) {
+	if w.height == 0 {
+		return
+	}
+	shape := w.borderStyle.shape
+	if shape == BorderNone {
+		return
+	}
+	style := w.borderStyleFor(windowType)
+	left := w.left
+	right := left + w.width
+	hasLeft := shape.HasLeft()
+	hasRight := shape.HasRight()
+	leftW := runeWidth(w.borderStyle.left)
+	rightW := runeWidth(w.borderStyle.right)
+	// Content rows: overpaint the left and right verticals (+ their 1-char margin) in
+	// the section's color. Inner margin stays at whatever bg the sub-window set.
+	for row := topContent; row <= bottomContent; row++ {
+		y := w.top + row
+		if hasLeft {
+			_screen.SetContent(left, y, w.borderStyle.left, nil, style)
+			_screen.SetContent(left+leftW, y, ' ', nil, style)
+		}
+		if hasRight {
+			_screen.SetContent(right-rightW-1, y, ' ', nil, style)
+			_screen.SetContent(right-rightW, y, w.borderStyle.right, nil, style)
+		}
+	}
+	if edge == SectionEdgeTop && shape.HasTop() {
+		var leftCap, rightCap rune
+		if hasLeft {
+			leftCap = w.borderStyle.topLeft
+		}
+		if hasRight {
+			rightCap = w.borderStyle.topRight
+		}
+		w.drawHLine(w.top, w.borderStyle.top, leftCap, rightCap, style)
+	}
+	if edge == SectionEdgeBottom && shape.HasBottom() {
+		var leftCap, rightCap rune
+		if hasLeft {
+			leftCap = w.borderStyle.bottomLeft
+		}
+		if hasRight {
+			rightCap = w.borderStyle.bottomRight
+		}
+		w.drawHLine(w.top+w.height-1, w.borderStyle.bottom, leftCap, rightCap, style)
+	}
 }
 
 func (w *TcellWindow) drawBorder(onlyHorizontal bool) {
@@ -995,72 +1140,44 @@ func (w *TcellWindow) drawBorder(onlyHorizontal bool) {
 	top := w.top
 	bot := top + w.height
 
-	var style tcell.Style
-	if w.color {
-		switch w.windowType {
-		case WindowBase:
-			style = ColBorder.style()
-		case WindowList:
-			style = ColListBorder.style()
-		case WindowHeader:
-			style = ColHeaderBorder.style()
-		case WindowFooter:
-			style = ColFooterBorder.style()
-		case WindowInput:
-			style = ColInputBorder.style()
-		case WindowPreview:
-			style = ColPreviewBorder.style()
-		}
-	} else {
-		style = w.normal.style()
-	}
+	style := w.borderStyleFor(w.windowType)
 
-	hw := runeWidth(w.borderStyle.top)
-	switch shape {
-	case BorderRounded, BorderSharp, BorderBold, BorderBlock, BorderThinBlock, BorderDouble, BorderHorizontal, BorderTop:
-		max := right - 2*hw
-		if shape == BorderHorizontal || shape == BorderTop {
-			max = right - hw
+	hasLeft := shape.HasLeft()
+	hasRight := shape.HasRight()
+
+	if shape.HasTop() {
+		var leftCap, rightCap rune
+		if hasLeft {
+			leftCap = w.borderStyle.topLeft
 		}
-		// tcell has an issue displaying two overlapping wide runes
-		// e.g.  SetContent(  HH  )
-		//       SetContent(   TR )
-		//       ==================
-		//                 (  HH  ) => TR is ignored
-		for x := left; x <= max; x += hw {
-			_screen.SetContent(x, top, w.borderStyle.top, nil, style)
+		if hasRight {
+			rightCap = w.borderStyle.topRight
 		}
+		w.drawHLine(top, w.borderStyle.top, leftCap, rightCap, style)
 	}
-	switch shape {
-	case BorderRounded, BorderSharp, BorderBold, BorderBlock, BorderThinBlock, BorderDouble, BorderHorizontal, BorderBottom:
-		max := right - 2*hw
-		if shape == BorderHorizontal || shape == BorderBottom {
-			max = right - hw
+	if shape.HasBottom() {
+		var leftCap, rightCap rune
+		if hasLeft {
+			leftCap = w.borderStyle.bottomLeft
 		}
-		for x := left; x <= max; x += hw {
-			_screen.SetContent(x, bot-1, w.borderStyle.bottom, nil, style)
+		if hasRight {
+			rightCap = w.borderStyle.bottomRight
 		}
+		w.drawHLine(bot-1, w.borderStyle.bottom, leftCap, rightCap, style)
 	}
 	if !onlyHorizontal {
-		switch shape {
-		case BorderRounded, BorderSharp, BorderBold, BorderBlock, BorderThinBlock, BorderDouble, BorderVertical, BorderLeft:
-			for y := top; y < bot; y++ {
+		vw := runeWidth(w.borderStyle.right)
+		for y := top; y < bot; y++ {
+			// Corner rows are already painted by drawHLine above / below.
+			if (y == top && shape.HasTop()) || (y == bot-1 && shape.HasBottom()) {
+				continue
+			}
+			if hasLeft {
 				_screen.SetContent(left, y, w.borderStyle.left, nil, style)
 			}
-		}
-		switch shape {
-		case BorderRounded, BorderSharp, BorderBold, BorderBlock, BorderThinBlock, BorderDouble, BorderVertical, BorderRight:
-			vw := runeWidth(w.borderStyle.right)
-			for y := top; y < bot; y++ {
+			if hasRight {
 				_screen.SetContent(right-vw, y, w.borderStyle.right, nil, style)
 			}
 		}
-	}
-	switch shape {
-	case BorderRounded, BorderSharp, BorderBold, BorderBlock, BorderThinBlock, BorderDouble:
-		_screen.SetContent(left, top, w.borderStyle.topLeft, nil, style)
-		_screen.SetContent(right-runeWidth(w.borderStyle.topRight), top, w.borderStyle.topRight, nil, style)
-		_screen.SetContent(left, bot-1, w.borderStyle.bottomLeft, nil, style)
-		_screen.SetContent(right-runeWidth(w.borderStyle.bottomRight), bot-1, w.borderStyle.bottomRight, nil, style)
 	}
 }

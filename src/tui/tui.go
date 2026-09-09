@@ -2,7 +2,9 @@ package tui
 
 import (
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/junegunn/fzf/src/util"
 	"github.com/rivo/uniseg"
@@ -17,7 +19,21 @@ const (
 	BoldForce     = Attr(1 << 10)
 	FullBg        = Attr(1 << 11)
 	Strip         = Attr(1 << 12)
+
+	// Underline style stored in bits 13-15 (3 bits, values 0-4)
+	// Only meaningful when the Underline attribute bit is also set.
+	// 0 = solid (default)
+	UnderlineStyleShift = 13
+	UnderlineStyleMask  = Attr(0b111 << UnderlineStyleShift)
+	UlStyleDouble       = Attr(0b001 << UnderlineStyleShift)
+	UlStyleCurly        = Attr(0b010 << UnderlineStyleShift)
+	UlStyleDotted       = Attr(0b011 << UnderlineStyleShift)
+	UlStyleDashed       = Attr(0b100 << UnderlineStyleShift)
 )
+
+func (a Attr) UnderlineStyle() Attr {
+	return a & UnderlineStyleMask
+}
 
 func (a Attr) Merge(b Attr) Attr {
 	if b&AttrRegular > 0 {
@@ -25,7 +41,12 @@ func (a Attr) Merge(b Attr) Attr {
 		return (b &^ AttrRegular) | (a & BoldForce)
 	}
 
-	return (a &^ AttrRegular) | b
+	merged := (a &^ AttrRegular) | b
+	// When b sets Underline, use b's underline style instead of OR'ing
+	if b&Underline > 0 {
+		merged = (merged &^ UnderlineStyleMask) | (b & UnderlineStyleMask)
+	}
+	return merged
 }
 
 // Types of user action
@@ -176,11 +197,6 @@ const (
 	CtrlAltShiftPageUp
 	CtrlAltShiftPageDown
 
-	Invalid
-	Fatal
-	BracketedPasteBegin
-	BracketedPasteEnd
-
 	Mouse
 	DoubleClick
 	LeftClick
@@ -194,7 +210,15 @@ const (
 	PreviewScrollUp
 	PreviewScrollDown
 
-	// Events
+	// Synthetic / non-user events. Everything from Invalid onward is
+	// either internally generated or a state-change notification, not
+	// direct user input. Use `>= Invalid` to gate activity tracking.
+	// BracketedPasteBegin/End sit here too: they enclose user input
+	// (which arrives as Rune events) and should not appear in FZF_KEY.
+	Invalid
+	Fatal
+	BracketedPasteBegin
+	BracketedPasteEnd
 	Resize
 	Change
 	BackwardEOF
@@ -209,6 +233,8 @@ const (
 	ClickHeader
 	ClickFooter
 	Multi
+	Every
+	ResultFinal
 )
 
 func (t EventType) AsEvent() Event {
@@ -226,6 +252,12 @@ func (t EventType) Byte() byte {
 func (e Event) Comparable() Event {
 	// Ignore MouseEvent pointer
 	return Event{e.Type, e.Char, nil}
+}
+
+// Printable returns true if the event is a printable character that can be
+// inserted into the query (e.g. via the 'put' action).
+func (e Event) Printable() bool {
+	return e.Type == Rune && unicode.IsGraphic(e.Char)
 }
 
 func (e Event) KeyName() string {
@@ -352,6 +384,7 @@ const (
 type ColorPair struct {
 	fg   Color
 	bg   Color
+	ul   Color
 	attr Attr
 }
 
@@ -363,11 +396,11 @@ func HexToColor(rrggbb string) Color {
 }
 
 func NewColorPair(fg Color, bg Color, attr Attr) ColorPair {
-	return ColorPair{fg, bg, attr}
+	return ColorPair{fg, bg, colDefault, attr}
 }
 
 func NoColorPair() ColorPair {
-	return ColorPair{-1, -1, 0}
+	return ColorPair{-1, -1, -1, 0}
 }
 
 func (p ColorPair) Fg() Color {
@@ -376,6 +409,16 @@ func (p ColorPair) Fg() Color {
 
 func (p ColorPair) Bg() Color {
 	return p.bg
+}
+
+func (p ColorPair) Ul() Color {
+	return p.ul
+}
+
+func (p ColorPair) WithUl(ul Color) ColorPair {
+	dup := p
+	dup.ul = ul
+	return dup
 }
 
 func (p ColorPair) Attr() Attr {
@@ -404,6 +447,9 @@ func (p ColorPair) merge(other ColorPair, except Color) ColorPair {
 	if other.bg != except {
 		dup.bg = other.bg
 	}
+	if other.ul != except {
+		dup.ul = other.ul
+	}
 	return dup
 }
 
@@ -413,15 +459,21 @@ func (p ColorPair) WithAttr(attr Attr) ColorPair {
 	return dup
 }
 
+func (p ColorPair) WithNewAttr(attr Attr) ColorPair {
+	dup := p
+	dup.attr = attr
+	return dup
+}
+
 func (p ColorPair) WithFg(fg ColorAttr) ColorPair {
 	dup := p
-	fgPair := ColorPair{fg.Color, colUndefined, fg.Attr}
+	fgPair := ColorPair{fg.Color, colUndefined, colUndefined, fg.Attr}
 	return dup.Merge(fgPair)
 }
 
 func (p ColorPair) WithBg(bg ColorAttr) ColorPair {
 	dup := p
-	bgPair := ColorPair{colUndefined, bg.Color, bg.Attr}
+	bgPair := ColorPair{colUndefined, bg.Color, colUndefined, bg.Attr}
 	return dup.Merge(bgPair)
 }
 
@@ -466,7 +518,7 @@ type ColorTheme struct {
 	CurrentMatch     ColorAttr
 	Spinner          ColorAttr
 	Info             ColorAttr
-	Cursor           ColorAttr
+	Pointer          ColorAttr
 	Marker           ColorAttr
 	Header           ColorAttr
 	HeaderBg         ColorAttr
@@ -486,6 +538,8 @@ type ColorTheme struct {
 	ListLabel        ColorAttr
 	ListBorder       ColorAttr
 	GapLine          ColorAttr
+	NthCurrentAttr   Attr // raw current-fg attr (before fg merge) for nth overlay
+	NthSelectedAttr  Attr // raw selected-fg attr (before ListFg inherit) for nth overlay
 }
 
 type Event struct {
@@ -553,11 +607,13 @@ const (
 	BorderBottom
 	BorderLeft
 	BorderRight
+	BorderInline
+	BorderDashed
 )
 
 func (s BorderShape) HasLeft() bool {
 	switch s {
-	case BorderNone, BorderPhantom, BorderLine, BorderRight, BorderTop, BorderBottom, BorderHorizontal: // No Left
+	case BorderNone, BorderPhantom, BorderLine, BorderInline, BorderRight, BorderTop, BorderBottom, BorderHorizontal: // No Left
 		return false
 	}
 	return true
@@ -565,7 +621,7 @@ func (s BorderShape) HasLeft() bool {
 
 func (s BorderShape) HasRight() bool {
 	switch s {
-	case BorderNone, BorderPhantom, BorderLine, BorderLeft, BorderTop, BorderBottom, BorderHorizontal: // No right
+	case BorderNone, BorderPhantom, BorderLine, BorderInline, BorderLeft, BorderTop, BorderBottom, BorderHorizontal: // No right
 		return false
 	}
 	return true
@@ -573,7 +629,7 @@ func (s BorderShape) HasRight() bool {
 
 func (s BorderShape) HasTop() bool {
 	switch s {
-	case BorderNone, BorderPhantom, BorderLine, BorderLeft, BorderRight, BorderBottom, BorderVertical: // No top
+	case BorderNone, BorderPhantom, BorderLine, BorderInline, BorderLeft, BorderRight, BorderBottom, BorderVertical: // No top
 		return false
 	}
 	return true
@@ -581,7 +637,7 @@ func (s BorderShape) HasTop() bool {
 
 func (s BorderShape) HasBottom() bool {
 	switch s {
-	case BorderNone, BorderPhantom, BorderLine, BorderLeft, BorderRight, BorderTop, BorderVertical: // No bottom
+	case BorderNone, BorderPhantom, BorderLine, BorderInline, BorderLeft, BorderRight, BorderTop, BorderVertical: // No bottom
 		return false
 	}
 	return true
@@ -601,6 +657,8 @@ type BorderStyle struct {
 	topRight    rune
 	bottomLeft  rune
 	bottomRight rune
+	leftMid     rune
+	rightMid    rune
 }
 
 type BorderCharacter int
@@ -616,7 +674,9 @@ func MakeBorderStyle(shape BorderShape, unicode bool) BorderStyle {
 			topLeft:     ' ',
 			topRight:    ' ',
 			bottomLeft:  ' ',
-			bottomRight: ' '}
+			bottomRight: ' ',
+			leftMid:     ' ',
+			rightMid:    ' '}
 	}
 	if !unicode {
 		return BorderStyle{
@@ -629,6 +689,8 @@ func MakeBorderStyle(shape BorderShape, unicode bool) BorderStyle {
 			topRight:    '+',
 			bottomLeft:  '+',
 			bottomRight: '+',
+			leftMid:     '+',
+			rightMid:    '+',
 		}
 	}
 	switch shape {
@@ -643,6 +705,8 @@ func MakeBorderStyle(shape BorderShape, unicode bool) BorderStyle {
 			topRight:    '┐',
 			bottomLeft:  '└',
 			bottomRight: '┘',
+			leftMid:     '├',
+			rightMid:    '┤',
 		}
 	case BorderBold:
 		return BorderStyle{
@@ -655,6 +719,8 @@ func MakeBorderStyle(shape BorderShape, unicode bool) BorderStyle {
 			topRight:    '┓',
 			bottomLeft:  '┗',
 			bottomRight: '┛',
+			leftMid:     '┣',
+			rightMid:    '┫',
 		}
 	case BorderBlock:
 		// ▛▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▜
@@ -670,6 +736,8 @@ func MakeBorderStyle(shape BorderShape, unicode bool) BorderStyle {
 			topRight:    '▜',
 			bottomLeft:  '▙',
 			bottomRight: '▟',
+			leftMid:     '▌',
+			rightMid:    '▐',
 		}
 
 	case BorderThinBlock:
@@ -686,6 +754,8 @@ func MakeBorderStyle(shape BorderShape, unicode bool) BorderStyle {
 			topRight:    '🭾',
 			bottomLeft:  '🭼',
 			bottomRight: '🭿',
+			leftMid:     '▏',
+			rightMid:    '▕',
 		}
 
 	case BorderDouble:
@@ -699,6 +769,25 @@ func MakeBorderStyle(shape BorderShape, unicode bool) BorderStyle {
 			topRight:    '╗',
 			bottomLeft:  '╚',
 			bottomRight: '╝',
+			leftMid:     '╠',
+			rightMid:    '╣',
+		}
+	case BorderDashed:
+		// Terminal cells are taller than wide (~2:1), so horizontals can use a
+		// sparse stub per cell while verticals need more dashes per cell to look
+		// evenly dashed. Rounded corners and sharp T-junction mids.
+		return BorderStyle{
+			shape:       shape,
+			top:         '╶',
+			bottom:      '╶',
+			left:        '┆',
+			right:       '┆',
+			topLeft:     '╭',
+			topRight:    '╮',
+			bottomLeft:  '╰',
+			bottomRight: '╯',
+			leftMid:     '├',
+			rightMid:    '┤',
 		}
 	}
 	return BorderStyle{
@@ -711,6 +800,8 @@ func MakeBorderStyle(shape BorderShape, unicode bool) BorderStyle {
 		topRight:    '╮',
 		bottomLeft:  '╰',
 		bottomRight: '╯',
+		leftMid:     '├',
+		rightMid:    '┤',
 	}
 }
 
@@ -732,6 +823,35 @@ const (
 	WindowFooter
 )
 
+// BorderColor returns the ColorPair used to draw borders for the given WindowType.
+func BorderColor(wt WindowType) ColorPair {
+	switch wt {
+	case WindowList:
+		return ColListBorder
+	case WindowInput:
+		return ColInputBorder
+	case WindowHeader:
+		return ColHeaderBorder
+	case WindowFooter:
+		return ColFooterBorder
+	case WindowPreview:
+		return ColPreviewBorder
+	}
+	return ColBorder
+}
+
+// SectionEdge selects which outer edge of the frame an inline section
+// should claim when PaintSectionFrame overpaints its adjacent border.
+// SectionEdgeNone paints only the inner verticals (for sections that
+// don't touch the outer top or bottom).
+type SectionEdge int
+
+const (
+	SectionEdgeNone SectionEdge = iota
+	SectionEdgeTop
+	SectionEdgeBottom
+)
+
 type Renderer interface {
 	DefaultTheme() *ColorTheme
 	Init() error
@@ -749,7 +869,8 @@ type Renderer interface {
 	HideCursor()
 	ShowCursor()
 
-	GetChar() Event
+	GetChar(cancellable bool) Event
+	CancelGetChar()
 
 	Top() int
 	MaxX() int
@@ -768,6 +889,19 @@ type Window interface {
 
 	DrawBorder()
 	DrawHBorder()
+	// DrawHSeparator draws an inline horizontal separator at `row` (relative to the
+	// window's top) using the color for `windowType`. The separator is conceptually
+	// the section's inner edge (e.g. the bottom border of an inline header), so the
+	// whole row including junctions carries the section's fg + bg. When useBottom is
+	// true the `bottom` horizontal char is used instead of `top`; for thinblock/block
+	// styles this keeps the thin line bonded to the list content on the opposite side.
+	DrawHSeparator(row int, windowType WindowType, useBottom bool)
+	// PaintSectionFrame overpaints the border cells around the rows [topContent,
+	// bottomContent] (inclusive, relative to the window's top) with the color for
+	// `windowType`. When edge is SectionEdgeTop / SectionEdgeBottom, the
+	// corresponding outer horizontal (+ corners) is also painted, letting the
+	// inline section claim that edge of the outer frame.
+	PaintSectionFrame(topContent, bottomContent int, windowType WindowType, edge SectionEdge)
 	Refresh()
 	FinishFill()
 
@@ -782,7 +916,7 @@ type Window interface {
 	Print(text string)
 	CPrint(color ColorPair, text string)
 	Fill(text string) FillReturn
-	CFill(fg Color, bg Color, attr Attr, text string) FillReturn
+	CFill(fg Color, bg Color, ul Color, attr Attr, text string) FillReturn
 	LinkBegin(uri string, params string)
 	LinkEnd()
 	Erase()
@@ -795,16 +929,18 @@ type FullscreenRenderer struct {
 	theme        *ColorTheme
 	mouse        bool
 	forceBlack   bool
+	tabstop      int
 	prevDownTime time.Time
 	clicks       [][2]int
 	showCursor   bool
 }
 
-func NewFullscreenRenderer(theme *ColorTheme, forceBlack bool, mouse bool) Renderer {
+func NewFullscreenRenderer(theme *ColorTheme, forceBlack bool, mouse bool, tabstop int) Renderer {
 	r := &FullscreenRenderer{
 		theme:        theme,
 		mouse:        mouse,
 		forceBlack:   forceBlack,
+		tabstop:      tabstop,
 		prevDownTime: time.Unix(0, 0),
 		clicks:       [][2]int{},
 		showCursor:   true}
@@ -824,18 +960,18 @@ var (
 	ColDisabled             ColorPair
 	ColGhost                ColorPair
 	ColMatch                ColorPair
-	ColCursor               ColorPair
-	ColCursorEmpty          ColorPair
-	ColCursorEmptyChar      ColorPair
-	ColAltCursorEmpty       ColorPair
-	ColAltCursorEmptyChar   ColorPair
+	ColPointer              ColorPair
+	ColPointerEmpty         ColorPair
+	ColPointerEmptyChar     ColorPair
+	ColAltPointerEmpty      ColorPair
+	ColAltPointerEmptyChar  ColorPair
 	ColMarker               ColorPair
 	ColSelected             ColorPair
 	ColSelectedMatch        ColorPair
 	ColCurrent              ColorPair
 	ColCurrentMatch         ColorPair
-	ColCurrentCursor        ColorPair
-	ColCurrentCursorEmpty   ColorPair
+	ColCurrentPointer       ColorPair
+	ColCurrentPointerEmpty  ColorPair
 	ColCurrentMarker        ColorPair
 	ColCurrentSelectedEmpty ColorPair
 	ColSpinner              ColorPair
@@ -867,51 +1003,56 @@ func init() {
 	undefined := ColorAttr{colUndefined, AttrUndefined}
 
 	NoColorTheme = &ColorTheme{
-		Colored:          false,
-		Input:            defaultColor,
-		Fg:               defaultColor,
-		Bg:               defaultColor,
-		ListFg:           defaultColor,
-		ListBg:           defaultColor,
+		Colored: false,
+		// Root colors. Everything else is left undefined so that overriding a
+		// root (e.g. --color bw,bg:blue) propagates to the derived colors,
+		// just like in the colored base themes.
+		Input:       defaultColor,
+		Fg:          defaultColor,
+		Bg:          defaultColor,
+		DarkBg:      defaultColor,
+		Prompt:      defaultColor,
+		Match:       defaultColor,
+		Spinner:     defaultColor,
+		Info:        defaultColor,
+		Pointer:     defaultColor,
+		Marker:      defaultColor,
+		Header:      defaultColor,
+		Footer:      defaultColor,
+		BorderLabel: defaultColor,
+		// Derived colors. Left undefined so they inherit from a root.
+		ListFg:           undefined,
+		ListBg:           undefined,
 		AltBg:            undefined,
-		SelectedFg:       defaultColor,
-		SelectedBg:       defaultColor,
-		SelectedMatch:    defaultColor,
-		DarkBg:           defaultColor,
-		Prompt:           defaultColor,
-		Match:            defaultColor,
+		SelectedFg:       undefined,
+		SelectedBg:       undefined,
+		SelectedMatch:    undefined,
 		Current:          undefined,
 		CurrentMatch:     undefined,
-		Spinner:          defaultColor,
-		Info:             defaultColor,
-		Cursor:           defaultColor,
-		Marker:           defaultColor,
-		Header:           defaultColor,
 		Border:           undefined,
-		BorderLabel:      defaultColor,
 		Ghost:            undefined,
-		Disabled:         defaultColor,
-		PreviewFg:        defaultColor,
-		PreviewBg:        defaultColor,
+		Disabled:         undefined,
+		PreviewFg:        undefined,
+		PreviewBg:        undefined,
 		Gutter:           undefined,
 		AltGutter:        undefined,
-		PreviewBorder:    defaultColor,
-		PreviewScrollbar: defaultColor,
-		PreviewLabel:     defaultColor,
-		ListLabel:        defaultColor,
-		ListBorder:       defaultColor,
-		Separator:        defaultColor,
-		Scrollbar:        defaultColor,
-		InputBg:          defaultColor,
-		InputBorder:      defaultColor,
-		InputLabel:       defaultColor,
-		HeaderBg:         defaultColor,
-		HeaderBorder:     defaultColor,
-		HeaderLabel:      defaultColor,
-		FooterBg:         defaultColor,
-		FooterBorder:     defaultColor,
-		FooterLabel:      defaultColor,
-		GapLine:          defaultColor,
+		PreviewBorder:    undefined,
+		PreviewScrollbar: undefined,
+		PreviewLabel:     undefined,
+		ListLabel:        undefined,
+		ListBorder:       undefined,
+		Separator:        undefined,
+		Scrollbar:        undefined,
+		InputBg:          undefined,
+		InputBorder:      undefined,
+		InputLabel:       undefined,
+		HeaderBg:         undefined,
+		HeaderBorder:     undefined,
+		HeaderLabel:      undefined,
+		FooterBg:         undefined,
+		FooterBorder:     undefined,
+		FooterLabel:      undefined,
+		GapLine:          undefined,
 		Nth:              undefined,
 		Nomatch:          undefined,
 	}
@@ -934,7 +1075,7 @@ func init() {
 		CurrentMatch:     undefined,
 		Spinner:          undefined,
 		Info:             undefined,
-		Cursor:           undefined,
+		Pointer:          undefined,
 		Marker:           undefined,
 		Header:           undefined,
 		Footer:           undefined,
@@ -985,7 +1126,7 @@ func init() {
 		CurrentMatch:     ColorAttr{colBrightGreen, AttrUndefined},
 		Spinner:          ColorAttr{colGreen, AttrUndefined},
 		Info:             ColorAttr{colYellow, AttrUndefined},
-		Cursor:           ColorAttr{colRed, AttrUndefined},
+		Pointer:          ColorAttr{colRed, AttrUndefined},
 		Marker:           ColorAttr{colMagenta, AttrUndefined},
 		Header:           ColorAttr{colCyan, AttrUndefined},
 		Footer:           ColorAttr{colCyan, AttrUndefined},
@@ -1036,7 +1177,7 @@ func init() {
 		CurrentMatch:     ColorAttr{151, AttrUndefined},
 		Spinner:          ColorAttr{148, AttrUndefined},
 		Info:             ColorAttr{144, AttrUndefined},
-		Cursor:           ColorAttr{161, AttrUndefined},
+		Pointer:          ColorAttr{161, AttrUndefined},
 		Marker:           ColorAttr{168, AttrUndefined},
 		Header:           ColorAttr{109, AttrUndefined},
 		Footer:           ColorAttr{109, AttrUndefined},
@@ -1087,7 +1228,7 @@ func init() {
 		CurrentMatch:     ColorAttr{23, AttrUndefined},
 		Spinner:          ColorAttr{65, AttrUndefined},
 		Info:             ColorAttr{101, AttrUndefined},
-		Cursor:           ColorAttr{161, AttrUndefined},
+		Pointer:          ColorAttr{161, AttrUndefined},
 		Marker:           ColorAttr{168, AttrUndefined},
 		Header:           ColorAttr{31, AttrUndefined},
 		Footer:           ColorAttr{31, AttrUndefined},
@@ -1121,7 +1262,7 @@ func init() {
 	}
 }
 
-func InitTheme(theme *ColorTheme, baseTheme *ColorTheme, boldify bool, forceBlack bool, hasInputWindow bool, hasHeaderWindow bool) {
+func InitTheme(theme *ColorTheme, baseTheme *ColorTheme, boldify bool, forceBlack bool, hasInputWindow bool, hasHeaderWindow bool, headerInline bool, footerInline bool) {
 	if forceBlack {
 		theme.Bg = ColorAttr{colBlack, AttrUndefined}
 	}
@@ -1138,7 +1279,7 @@ func InitTheme(theme *ColorTheme, baseTheme *ColorTheme, boldify bool, forceBlac
 		theme.CurrentMatch = boldify(theme.CurrentMatch)
 		theme.Prompt = boldify(theme.Prompt)
 		theme.Input = boldify(theme.Input)
-		theme.Cursor = boldify(theme.Cursor)
+		theme.Pointer = boldify(theme.Pointer)
 		theme.Spinner = boldify(theme.Spinner)
 	}
 
@@ -1162,13 +1303,19 @@ func InitTheme(theme *ColorTheme, baseTheme *ColorTheme, boldify bool, forceBlac
 		match.Attr = Underline
 	}
 	theme.Match = o(baseTheme.Match, match)
-	// Inherit from 'fg', so that we don't have to write 'current-fg:dim'
+	// These colors are not defined in the base themes.
+	// Resolve ListFg/ListBg early so Current and Selected can inherit from them.
+	theme.ListFg = o(theme.Fg, theme.ListFg)
+	theme.ListBg = o(theme.Bg, theme.ListBg)
+	// Inherit from 'list-fg', so that we don't have to write 'current-fg:dim'
 	// e.g. fzf --delimiter / --nth -1 --color fg:dim,nth:regular
 	current := theme.Current
 	if !baseTheme.Colored && current.IsUndefined() {
 		current.Attr |= Reverse
 	}
-	theme.Current = theme.Fg.Merge(o(baseTheme.Current, current))
+	resolvedCurrent := o(baseTheme.Current, current)
+	theme.NthCurrentAttr = resolvedCurrent.Attr
+	theme.Current = theme.ListFg.Merge(resolvedCurrent)
 	currentMatch := theme.CurrentMatch
 	if !baseTheme.Colored && currentMatch.IsUndefined() {
 		currentMatch.Attr |= Reverse | Underline
@@ -1176,7 +1323,7 @@ func InitTheme(theme *ColorTheme, baseTheme *ColorTheme, boldify bool, forceBlac
 	theme.CurrentMatch = o(baseTheme.CurrentMatch, currentMatch)
 	theme.Spinner = o(baseTheme.Spinner, theme.Spinner)
 	theme.Info = o(baseTheme.Info, theme.Info)
-	theme.Cursor = o(baseTheme.Cursor, theme.Cursor)
+	theme.Pointer = o(baseTheme.Pointer, theme.Pointer)
 	theme.Marker = o(baseTheme.Marker, theme.Marker)
 	theme.Header = o(baseTheme.Header, theme.Header)
 	theme.Footer = o(baseTheme.Footer, theme.Footer)
@@ -1193,10 +1340,8 @@ func InitTheme(theme *ColorTheme, baseTheme *ColorTheme, boldify bool, forceBlac
 	scrollbarDefined := theme.Scrollbar != undefined
 	previewBorderDefined := theme.PreviewBorder != undefined
 
-	// These colors are not defined in the base themes
-	theme.ListFg = o(theme.Fg, theme.ListFg)
-	theme.ListBg = o(theme.Bg, theme.ListBg)
-	theme.SelectedFg = o(theme.ListFg, theme.SelectedFg)
+	theme.NthSelectedAttr = theme.SelectedFg.Attr
+	theme.SelectedFg = theme.ListFg.Merge(theme.SelectedFg)
 	theme.SelectedBg = o(theme.ListBg, theme.SelectedBg)
 	theme.SelectedMatch = o(theme.Match, theme.SelectedMatch)
 
@@ -1251,11 +1396,22 @@ func InitTheme(theme *ColorTheme, baseTheme *ColorTheme, boldify bool, forceBlac
 	} else {
 		theme.HeaderBg = o(theme.Bg, theme.ListBg)
 	}
-	theme.HeaderBorder = o(theme.Border, theme.HeaderBorder)
+	// Inline header/footer borders sit inside the list frame, so default their color
+	// to the list-border color when the user has not explicitly set it. The inline
+	// separator then matches the surrounding frame.
+	headerBorderFallback := theme.Border
+	if headerInline {
+		headerBorderFallback = theme.ListBorder
+	}
+	theme.HeaderBorder = o(headerBorderFallback, theme.HeaderBorder)
 	theme.HeaderLabel = o(theme.BorderLabel, theme.HeaderLabel)
 
 	theme.FooterBg = o(theme.Bg, theme.FooterBg)
-	theme.FooterBorder = o(theme.Border, theme.FooterBorder)
+	footerBorderFallback := theme.Border
+	if footerInline {
+		footerBorderFallback = theme.ListBorder
+	}
+	theme.FooterBorder = o(footerBorderFallback, theme.FooterBorder)
 	theme.FooterLabel = o(theme.BorderLabel, theme.FooterLabel)
 
 	if theme.Nomatch.IsUndefined() {
@@ -1270,7 +1426,7 @@ func initPalette(theme *ColorTheme) {
 		if fg.Color == colDefault && (fg.Attr&Reverse) > 0 {
 			bg.Color = colDefault
 		}
-		return ColorPair{fg.Color, bg.Color, fg.Attr}
+		return ColorPair{fg.Color, bg.Color, colDefault, fg.Attr}
 	}
 	blank := theme.ListFg
 	blank.Attr = AttrRegular
@@ -1283,11 +1439,11 @@ func initPalette(theme *ColorTheme) {
 	ColDisabled = pair(theme.Disabled, theme.InputBg)
 	ColMatch = pair(theme.Match, theme.ListBg)
 	ColSelectedMatch = pair(theme.SelectedMatch, theme.SelectedBg)
-	ColCursor = pair(theme.Cursor, theme.Gutter)
-	ColCursorEmpty = pair(blank, theme.Gutter)
-	ColCursorEmptyChar = pair(theme.Gutter, theme.ListBg)
-	ColAltCursorEmpty = pair(blank, theme.AltGutter)
-	ColAltCursorEmptyChar = pair(theme.AltGutter, theme.ListBg)
+	ColPointer = pair(theme.Pointer, theme.Gutter)
+	ColPointerEmpty = pair(blank, theme.Gutter)
+	ColPointerEmptyChar = pair(theme.Gutter, theme.ListBg)
+	ColAltPointerEmpty = pair(blank, theme.AltGutter)
+	ColAltPointerEmptyChar = pair(theme.AltGutter, theme.ListBg)
 	if theme.SelectedBg.Color != theme.ListBg.Color {
 		ColMarker = pair(theme.Marker, theme.SelectedBg)
 	} else {
@@ -1295,8 +1451,8 @@ func initPalette(theme *ColorTheme) {
 	}
 	ColCurrent = pair(theme.Current, theme.DarkBg)
 	ColCurrentMatch = pair(theme.CurrentMatch, theme.DarkBg)
-	ColCurrentCursor = pair(theme.Cursor, theme.DarkBg)
-	ColCurrentCursorEmpty = pair(blank, theme.DarkBg)
+	ColCurrentPointer = pair(theme.Pointer, theme.DarkBg)
+	ColCurrentPointerEmpty = pair(blank, theme.DarkBg)
 	ColCurrentMarker = pair(theme.Marker, theme.DarkBg)
 	ColCurrentSelectedEmpty = pair(blank, theme.DarkBg)
 	ColSpinner = pair(theme.Spinner, theme.InputBg)
@@ -1325,4 +1481,47 @@ func initPalette(theme *ColorTheme) {
 
 func runeWidth(r rune) int {
 	return uniseg.StringWidth(string(r))
+}
+
+// WrappedLine represents a single visual line after character-level wrapping.
+type WrappedLine struct {
+	Text         string
+	DisplayWidth int
+}
+
+// WrapLine splits a single line (no embedded \n) into visual lines
+// that fit within initialMax columns. Character-level wrapping only.
+func WrapLine(input string, prefixLength int, initialMax int, tabstop int, wrapSignWidth int) []WrappedLine {
+	lines := []WrappedLine{}
+	width := 0
+	line := ""
+	gr := uniseg.NewGraphemes(input)
+	maxWidth := initialMax
+	contMax := max(1, initialMax-wrapSignWidth)
+	for gr.Next() {
+		rs := gr.Runes()
+		str := string(rs)
+		var w int
+		if len(rs) == 1 && rs[0] == '\t' {
+			w = tabstop - (prefixLength+width)%tabstop
+			str = strings.Repeat(" ", w)
+		} else if rs[0] == '\r' {
+			w++
+		} else {
+			w = uniseg.StringWidth(str)
+		}
+		width += w
+
+		if prefixLength+width <= maxWidth {
+			line += str
+		} else {
+			lines = append(lines, WrappedLine{string(line), width - w})
+			line = str
+			prefixLength = 0
+			width = w
+			maxWidth = contMax
+		}
+	}
+	lines = append(lines, WrappedLine{string(line), width})
+	return lines
 }

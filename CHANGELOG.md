@@ -1,6 +1,338 @@
 CHANGELOG
 =========
 
+0.74.4
+------
+- Fixed an escape sequence split across reads being parsed as a fragment, which leaked the rest into the query (#4899)
+    - e.g. A terminal answering the startup `DECRQM` query late left `?2004;2$y`, CTRL-UP left `5A`, and SGR mouse input left `0;1;1M`
+- Fixed `--tiebreak=pathname` not detecting the last path separator when the line contains a non-ASCII character before it (#4902)
+- Fixed `progress` in the `--listen` status payload staying at 100 while a new search was running, which made a snapshot with a new query and the previous result set look complete (#4903)
+    - It is now reset when a search starts and reaches 100 on the final result, so `progress` of 100 means the matches belong to the query reported next to them
+- Fixed adaptive height not reserving a line for the divider of an inline header or footer border, so the list came up one line short for each of them (#4904)
+    - e.g. `seq 10 | fzf --height=~100% --list-border --header-lines=1 --header-lines-border=inline`
+- Vim plugin
+    - fzf no longer blocks the editor, so live previews keep working while fzf is open
+        - `fzf#run` returns an empty list when it runs fzf asynchronously. Use `sink`, `sinklist`, or `exit` to get the result
+    - The popup layout now works under Zellij
+    - Added `popup` as a synonym of the `tmux` layout key
+      ```vim
+      let g:fzf_layout = { 'popup': '90%,70%' }
+      ```
+    - fzf now opens in a tmux or Zellij floating pane by default, so the window it was started from stays visible and can be used while fzf is running
+        - Requires tmux 3.7+ or Zellij 0.44+
+        - Set `g:fzf_layout` to pick a different layout
+- fish:
+    - Fixed custom CTRL-T command not using the prefixed target directory in some cases (#4498)
+    - Optimized description alignment of completion items (#4910)
+
+0.74.3
+------
+- Performance optimizations for non-ASCII input
+    - ASCII queries are up to 16x faster
+    - Non-ASCII queries are up to 12x faster
+    - Reading accented Latin input is up to 37% faster
+    - Reading CJK input reduces memory use by up to 29%
+    - ASCII input is unaffected
+- Fixed an image from a preview command being torn apart when its rows are separated by IND instead of newlines, as `chafa` does under tmux (#4885)
+- Fixed `replace-query` corrupting the item text when the query is edited afterwards
+- fzf no longer turns bracketed paste mode off on exit when the terminal already had it on, which broke pasting in shells that run fzf from a line editor widget (#4887)
+- Fixed startup blocking on terminals that never answer escape sequences, such as FreeBSD virtual terminals. fzf waited for a reply until a key was pressed, then dropped that keystroke (#2860, #976)
+
+0.74.2
+------
+- Performance optimizations for short queries
+    - Short queries scan the largest candidate sets, and the first keystroke scans the whole input
+    - Single-character queries are up to 2.4x faster
+    - Two-character queries are up to 1.4x faster
+- Faster sorting of search results, skipping redundant radix passes
+- `change-border-label` and `transform-border-label` now work on the native border of a tmux or Zellij floating pane
+- Fixed Kitty graphics sequences from a preview command being taken by tmux as pane title requests
+- Fixed an image at the top of the preview being torn by `--preview-window ~N`
+- Fixed nondeterministic match highlight positions
+- Fixed signal and resize handlers persisting after `Run()` returns when fzf is used as a library
+- fzf now detects terminal resize on Windows in `--height` mode (#4790) (@Cyrus580529)
+- fish: fixed history command being affected by user initialization scripts, and improved timestamp colors in CTRL-R (#4862) (@bitraid)
+- zsh: fixed CTRL-R not propagating the exit status of fzf when perl is available (#4871) (@LangLangBart, @Toliak)
+- zsh: fixed `chpwd` hook functions being called twice by ALT-C (#4879) (@LangLangBart, @lucc)
+
+0.74.1
+------
+- The default separator on the info line is no longer shown when the input section is already visually separated from the list section by a border line
+  ```sh
+  # No separator shown below the header border
+  fzf --style full --input-border none --header foo
+
+  # Separator shown; no border separates the input section from the list section
+  fzf --style full --input-border none --header foo --no-header-border
+
+  # No separator below the border of the preview window at 'next' position
+  fzf --preview : --preview-window next
+
+  # Conversely, separator is now shown when the input border does not draw
+  # a line facing the list section
+  fzf --input-border bottom
+  ```
+- Rendering improvements
+    - Each frame is now wrapped in synchronized update mode (mode 2026) to reduce flickering on supported terminals
+    - Reduced rendering output by 10-23% by skipping redundant SGR sequences
+    - Fixed ghost characters and misplaced colors inside Zellij by using CHA instead of CR + CUF for horizontal cursor movement (#4858, zellij-org/zellij#5370)
+    - Fixed cursor restoration on exit with `--height --no-clear` inside Neovim terminal by using DECSC/DECRC instead of `CSI s`/`CSI u`
+- nushell: fixed deprecation error of `str downcase` on nushell 0.114.0 or above (#4857) (@sim590)
+- Each release now includes `.deb` packages for easy installation on Debian-based distros (#4859)
+
+0.74.0
+------
+_Release highlights: https://junegunn.github.io/fzf/releases/0.74.0/_
+
+- On tmux 3.7 or above, `--popup` starts fzf in a floating pane instead of a popup (#4850)
+    - Unlike a popup, a floating pane is not modal; you can switch to other panes and windows while fzf is running, move and resize the pane with the mouse, zoom it to fullscreen, and use copy-mode in it
+    - A floating pane always has a native border, which is what makes the pane movable and resizable, so `border-native` is implied
+    - A popup is used instead when a border style is explicitly specified with `--border`, so that the fzf-drawn border is the only border shown (`none` and `line` are treated as no border)
+      ```sh
+      fzf --popup --border
+      ```
+    - `--border-label` is set as the title of the floating pane, and is displayed on the border if `pane-border-status` is enabled in tmux
+      ```sh
+      fzf --popup --border-label ' fzf '
+      ```
+- On Zellij, `--popup` uses the native border by default, consistent with tmux, so that the pane can be moved and resized with the mouse; fzf draws its own border when a border style is explicitly specified with `--border`
+    - `--border-label` is set as the name of the pane, displayed on the native border
+- Added `result-final` event, a variant of `result` that is not triggered while the input stream is still open (#4835)
+    - Use it for one-shot, per-query actions that would otherwise re-fire on every intermediate snapshot during loading
+      ```sh
+      # 'result' fires per intermediate snapshot (header keeps updating during load);
+      # 'result-final' fires once after the stream closes (footer shows the final count)
+      (seq 100; sleep 1; seq 100) | fzf --query 1 \
+        --bind 'result:transform-header(echo result: $FZF_MATCH_COUNT),result-final:transform-footer(echo final: $FZF_MATCH_COUNT)'
+      ```
+- Added `wait` action to block subsequent actions until search completes (#4825)
+    - Useful for chaining query-changing actions with motion actions to ensure operations on complete results
+      ```sh
+      # Wait for search to complete before moving to the best match
+      fzf --bind 'start:change-query(foo)+wait+best'
+      ```
+    - The initial loading of the input is also considered a search in progress, so `start:wait` can be used to wait until the input is fully loaded
+      ```sh
+      # Move to the last item after the input is fully loaded
+      (seq 1000; sleep 1; seq 1001 2000) | fzf --bind 'start:wait+last'
+      ```
+- Bound `alt-left` to `backward-word` and `alt-right` to `forward-word` by default (#4833)
+- Bug fixes and improvements
+    - Skip `$FZF_CURRENT_ITEM` export when the item is larger than 64 KB; a huge item can overflow `ARG_MAX` and break preview and other child commands with `E2BIG` (#4806)
+    - `transform` and `bg-transform` now allow a bare `put` action in the output to insert the key that triggered the action
+      ```sh
+      # Insert the typed key ('a') into the query
+      fzf --bind 'a:transform:echo put'
+      ```
+    - `ALT-C` in zsh no longer resolves symbolic links when changing the directory, consistent with the `cd` builtin (#4816) (@silverneko)
+    - Fixed horizontal mouse wheel events being treated as vertical scrolling (#4848) (@jason5122)
+    - Fixed `bw` theme not inheriting overridden colors
+    - fish: `CTRL-R` now works when `$fish_color_normal` or `$fish_color_comment` is empty or invalid (#4831) (@bitraid)
+    - Fixed empty-shell detection in the install script (#4813)
+    - Fixed the install script writing nushell source lines into the config files of other shells (#4812)
+
+0.73.1
+------
+- Bug fixes
+    - Skip `$FZF_CURRENT_ITEM` export when the item contains a NUL byte; `exec(2)` rejects the env, breaking preview and other child commands (#4806)
+    - Fixed O(n^2) HTTP body accumulation in `--listen`; a single ~390 KB request could block the single-threaded server for ~8 s (Michal Majchrowicz, Marcin Wyczechowski, AFINE Team)
+
+0.73.0
+------
+_Release highlights: https://junegunn.github.io/fzf/releases/0.73.0/_
+
+- Nushell integration via `fzf --nushell` and the installer (#4630) (@sim590)
+- New `--preview-window=next` position that places the preview adjacent to the input section, on the list side: above the input in the default layout, below it in `--layout=reverse` (#4798)
+- Timer-driven `every(N)` event for `--bind`, where `N` is seconds
+- Added `$FZF_IDLE_TIME` (whole seconds) and `$FZF_IDLE_TIME_MS` (milliseconds), holding the elapsed time since the last user activity
+    - Pair with `every(N)` to build idle-based behavior such as auto-accept or auto-quit (#1211)
+      ```sh
+      # Live process list; --track --id-nth 2 keeps the cursor on the same PID across reloads
+      fzf --header-lines 1 --track --id-nth 2 --bind 'start,every(2):reload-sync:ps -ef'
+
+      # Auto-accept after 10 seconds of inactivity, with a countdown in the footer after 5s
+      fzf --bind 'every(1):bg-transform:
+        if   [[ $FZF_IDLE_TIME -lt 5  ]]; then echo change-footer:
+        elif [[ $FZF_IDLE_TIME -lt 10 ]]; then echo "change-footer:auto-accept in $((10 - FZF_IDLE_TIME))s"
+        else echo accept
+        fi'
+      ```
+- Added `$FZF_CURRENT_ITEM` for shells where quoting `{}` is awkward (#4802)
+- Bug fixes
+    - Scoring: non-word characters at the start of input or after a delimiter now receive the same boundary bonus as word characters (#4795)
+    - `change-preview-window` no longer resets `wrap` / `wrap-word` state set via `toggle-preview-wrap` / `toggle-preview-wrap-word` (#4791)
+    - Stripped UTF-8-encoded C1 control characters from rendered items to prevent terminal control-sequence injection
+    - Fixed integer-overflow panic in `FuzzyMatchV2` on 32-bit builds (Michal Majchrowicz, Marcin Wyczechowski, AFINE Team)
+    - Fixed `bg-transform` `reload` / `exclude` payloads being dropped
+    - Fixed rendering glitch with preview window on the left combined with footer
+
+0.72.0
+------
+_Release highlights: https://junegunn.github.io/fzf/releases/0.72.0/_
+
+- `--header-border`, `--header-lines-border`, and `--footer-border` now accept a new `inline` style that embeds the section inside the list frame, separated from the list content by a horizontal line. When the list border has side segments, the separator joins them as T-junctions.
+    - Requires a `--list-border` shape that has both top and bottom segments (`rounded`, `sharp`, `bold`, `double`, `block`, `thinblock`, or `horizontal`); falls back to `line` otherwise. `horizontal` has no side borders, so the separator is drawn without T-junction endpoints.
+    - Sections stack. Example combining all three:
+      ```sh
+      ps -ef | fzf --reverse --style full \
+          --header 'Select a process' --header-lines 1 \
+          --bind 'load:transform-footer:echo $FZF_TOTAL_COUNT processes' \
+          --header-border dashed --header-first \
+          --header-lines-border inline --footer-border inline
+      ```
+    - `--header-label` and `--footer-label` render on their respective separator row.
+    - The separator inherits `--color list-border` when the section's own border color is not explicitly set.
+    - `inline` takes precedence over `--header-first`: the inline section stays inside the list frame. `--header-border=inline` requires `--header-lines-border` to be `inline` or unset.
+- New `dashed` border style with dashed edges (`╶` / `┆`) and rounded corners.
+    - `--border=dashed`, `--list-border=dashed`, etc.
+    - Works with inline sections (T-junctions render correctly).
+- [vim] Move and resize popup window when detecting `VimResized` event (#4778) (@Vulcalien)
+- Bug fixes
+    - Fixed gutter display in `--style=minimal`
+    - Fixed arrow keys / Home / End without modifiers being ignored under the kitty keyboard protocol (#4776) (@TymekDev)
+    - bash: Persist history deletion when `histappend` is on (#4764)
+
+0.71.0
+------
+_Release highlights: https://junegunn.github.io/fzf/releases/0.71.0/_
+
+- Added `--popup` as a new name for `--tmux` with Zellij support
+    - `--popup` starts fzf in a tmux popup or a Zellij floating pane
+    - `--tmux` is now an alias for `--popup`
+    - Requires tmux 3.3+ or Zellij 0.44+
+- Cross-reload item identity with `--id-nth`
+    - Added `--id-nth=NTH` to define item identity fields for cross-reload operations
+    - When a `reload` is triggered with tracking enabled, fzf searches for the tracked item by its identity fields in the new list.
+        - `--track --id-nth ..` tracks by the entire line
+        - `--track --id-nth 1` tracks by the first field
+        - `--track` without `--id-nth` retains the existing index-based tracking behavior
+        - The UI is temporarily blocked (prompt dimmed, input disabled) until the item is found or loading completes.
+            - Press `Escape` or `Ctrl-C` to cancel the blocked state without quitting
+            - Info line shows `+T*` / `+t*` while searching
+    - With `--multi`, selected items are preserved across `reload-sync` by matching their identity fields
+- Performance improvements
+    - The search performance now scales linearly with the number of CPU cores, as we dropped static partitioning to allow better load balancing across threads.
+      ```
+      === query: 'linux' ===
+        [all]   baseline:    21.95ms  current:    17.47ms  (1.26x)  matches: 179966 (12.79%)
+        [1T]    baseline:   179.63ms  current:   180.53ms  (1.00x)  matches: 179966 (12.79%)
+        [2T]    baseline:    97.38ms  current:    90.05ms  (1.08x)  matches: 179966 (12.79%)
+        [4T]    baseline:    53.83ms  current:    44.77ms  (1.20x)  matches: 179966 (12.79%)
+        [8T]    baseline:    41.66ms  current:    22.58ms  (1.84x)  matches: 179966 (12.79%)
+      ```
+    - Improved the cache structure, reducing memory footprint per entry by 86x.
+        - With the reduced per-entry cost, the cache now has broader coverage.
+- Shell integration improvements
+    - bash: CTRL-R now supports multi-select and `shift-delete` to delete history entries (#4715)
+    - fish:
+        - Improved command history (CTRL-R) (#4703) (@bitraid)
+        - Rewrite completion script (SHIFT-TAB) (#4731) (@bitraid)
+        - Increase minimum fish version requirement to 3.4.0 (#4731) (@bitraid)
+- `GET /` HTTP endpoint now includes `positions` field in each match entry, providing the indices of matched characters for external highlighting (#4726)
+- Allow adaptive height with negative value (`--height=~-HEIGHT`) (#4682)
+- Bug fixes
+    - `--walker=follow` no longer follows symlinks whose target is an ancestor of the walker root, avoiding severe resource exhaustion when a symlink points outside the tree (e.g. Wine's `z:` → `/`) (#4710)
+    - Fixed AWK tokenizer not treating a new line character as whitespace
+    - Fixed `--{accept,with}-nth` removing trailing whitespaces with a non-default `--delimiter`
+    - Fixed OSC8 hyperlinks being mangled when the URL contains unicode characters (#4707)
+    - Fixed `--with-shell` not handling quoted arguments correctly (#4709)
+    - Fixed child processes not being terminated on Windows (#4723) (@pjeby)
+    - Fixed preview scrollbar not rendered after `toggle-preview`
+    - Fixed preview follow/scroll with long wrapped lines
+    - Fixed tab width when `--frozen-left` is used
+    - Fixed preview mouse events being processed when no preview window exists
+    - zsh: Fixed history widget when `sh_glob` option is on (#4714) (@EvanHahn)
+
+0.70.0
+------
+- Added `change-with-nth` action for dynamically changing the `--with-nth` option.
+    - Requires `--with-nth` to be set initially.
+    - Multiple options separated by `|` can be given to cycle through.
+  ```sh
+  echo -e "a b c\nd e f\ng h i" | fzf --with-nth .. \
+    --bind 'space:change-with-nth(1|2|3|1,3|2,3|)'
+  ```
+- Added `change-header-lines` action for dynamically changing the `--header-lines` option
+- Performance improvements (1.3x to 1.9x faster filtering depending on query)
+  ```
+  === query: 'l' ===
+    [all]   baseline:   168.87ms  current:    95.21ms  (1.77x)  matches: 5069891 (94.78%)
+    [1T]    baseline:  1652.22ms  current:   841.40ms  (1.96x)  matches: 5069891 (94.78%)
+
+  === query: 'lin' ===
+    [all]   baseline:   343.27ms  current:   252.59ms  (1.36x)  matches: 3516507 (65.74%)
+    [1T]    baseline:  3199.89ms  current:  2230.64ms  (1.43x)  matches: 3516507 (65.74%)
+
+  === query: 'linux' ===
+    [all]   baseline:    85.47ms  current:    63.72ms  (1.34x)  matches: 307229 (5.74%)
+    [1T]    baseline:   774.64ms  current:   589.32ms  (1.31x)  matches: 307229 (5.74%)
+
+  === query: 'linuxlinux' ===
+    [all]   baseline:    55.13ms  current:    35.67ms  (1.55x)  matches: 12230 (0.23%)
+    [1T]    baseline:   461.99ms  current:   332.38ms  (1.39x)  matches: 12230 (0.23%)
+
+  === query: 'linuxlinuxlinux' ===
+    [all]   baseline:    51.77ms  current:    32.53ms  (1.59x)  matches: 865 (0.02%)
+    [1T]    baseline:   409.99ms  current:   296.33ms  (1.38x)  matches: 865 (0.02%)
+  ```
+- Fixed `nth` attribute merge order to respect precedence hierarchy (#4697)
+- bash: Replaced `printf` with builtin `printf` to bypass local indirections (#4684) (@DarrenBishop)
+
+0.68.0
+------
+- Implemented word wrapping in the list section
+    - Added `--wrap=word` (or `--wrap-word`) option and `toggle-wrap-word` action for word-level line wrapping in the list section
+    - Changed default binding of `ctrl-/` and `alt-/` from `toggle-wrap` to `toggle-wrap-word`
+  ```sh
+  fzf --wrap=word
+  ```
+- Implemented word wrapping in the preview window
+    - Added `wrap-word` flag for `--preview-window` to enable word-level wrapping
+    - Added `toggle-preview-wrap-word` action
+  ```sh
+  fzf --preview 'bat --style=plain --color=always {}' \
+      --preview-window wrap-word \
+      --bind space:toggle-preview-wrap-word
+  ```
+- Added support for underline style variants in `--color`: `underline-double`, `underline-curly`, `underline-dotted`, `underline-dashed`
+  ```sh
+  fzf --color 'fg:underline-curly,current-fg:underline-dashed'
+  ```
+- Added support for underline styles (`4:N`) and underline colors (SGR 58/59)
+  ```sh
+  # In the list section
+  printf '\e[4:3;58;2;255;0;0mRed curly underline\e[0m\n' | fzf --ansi
+
+  # In the preview window
+  fzf --preview "printf '\e[4:3;58;2;255;0;0mRed curly underline\e[0m\n'"
+  ```
+- Added `--preview-wrap-sign` to set a different wrap indicator for the preview window
+- Added `alt-gutter` color option (#4602) (@hedgieinsocks)
+- Added `$FZF_WRAP` environment variable to child processes (`char` or `word` when wrapping is enabled) (#4672) (@bitraid)
+- fish: Improved command history (CTRL-R) (#4672) (@bitraid)
+    - Enabled syntax highlighting in the list on fish 4.3.3+
+    - Added syntax-highlighted preview window that auto-shows for long or multi-line commands
+    - Added `ALT-ENTER` to reformat and insert selected commands
+    - Improved handling of bulk deletion of selected history entries (`SHIFT-DELETE`)
+- Added fish completion support (#4605) (@lalvarezt)
+- zsh: Handle multi-line history selection (#4595) (@LangLangBart)
+- Bug fixes
+    - Fixed `_fzf_compgen_{path,dir}` to respect `FZF_COMPLETION_{PATH,DIR}_OPTS` (#4592) (@shtse8, @LangLangBart)
+    - Fixed `--preview-window follow` not working correctly with wrapping (#3243, #4258)
+    - Fixed symlinks to directories being returned as files (#4676) (@skk64)
+    - Fixed SIGHUP signal handling (#4668) (@LangLangBart)
+    - Fixed preview process not killed on exit (#4667)
+    - Fixed coloring of items with zero-width characters (#4620)
+    - Fixed `track-current` unset after a combined movement action (#4649)
+    - Fixed `--accept-nth` being ignored in filter mode (#4636) (@charemma)
+    - Fixed display width calculation with `maxWidth` (#4596) (@LangLangBart)
+    - Fixed clearing of the rest of the current line on start (#4652)
+    - Fixed `x-api-key` header not required for GET requests (#4627)
+    - Fixed key reading not cancelled when `execute` triggered via a server request (#4653)
+    - Fixed rebind of readline command `redraw-current-line` (#4635) (@jameslazo)
+    - Fixed `fzf-tmux` `TERM` quoting and added `mktemp` usage (#4664) (@Goofygiraffe06)
+    - Do not allow very long queries in `FuzzyMatchV2` (#4608)
+
 0.67.0
 ------
 - Added `--freeze-left=N` option to keep the leftmost N columns always visible.

@@ -13,7 +13,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/junegunn/fzf/src/util"
-	"github.com/rivo/uniseg"
 
 	"golang.org/x/term"
 )
@@ -25,13 +24,44 @@ const (
 	defaultEscDelay = 100
 	escPollInterval = 5
 	offsetPollTries = 10
+	queryTimeout    = 500 * time.Millisecond
 	maxInputBuffer  = 1024 * 1024
+	escapeLookback  = 256
+	maxSelectTries  = 100
 )
 
 const DefaultTtyDevice string = "/dev/tty"
 
-var offsetRegexp = regexp.MustCompile("(.*?)\x00?\x1b\\[([0-9]+);([0-9]+)R")
+var offsetRegexp = regexp.MustCompile("\x00?\x1b\\[([0-9]+);([0-9]+)R")
 var offsetRegexpBegin = regexp.MustCompile("^\x1b\\[[0-9]+;[0-9]+R")
+
+// DECRPM reply to the DECRQM query for bracketed paste mode. Ps is 1 or 3 when
+// the mode was already set, 2 or 4 when reset, 0 when the terminal does not
+// recognize the mode.
+var pasteModeRegexp = regexp.MustCompile("\x00?\x1b\\[\\?2004;([0-4])\\$y")
+var pasteModeRegexpBegin = regexp.MustCompile("^\x1b\\[\\?2004;[0-4]\\$y")
+
+// A report to ask the terminal for, and the reply to recognize it by.
+type termQuery struct {
+	seq   string
+	reply *regexp.Regexp
+}
+
+var offsetQuery = termQuery{"6n", offsetRegexp}
+var pasteModeQuery = termQuery{"?2004$p", pasteModeRegexp}
+
+// What we ask the terminal at startup, in the order the queries go out.
+// A terminal answers them in that order, so the cursor position query is last
+// and also ends the wait: every terminal fzf supports answers it, so once its
+// reply arrives, a query still unanswered is one the terminal does not know
+// rather than one we stopped waiting for too early.
+//
+// Terminals that don't support the paste mode query (DECRQM) might leave
+// 'p' on the screen. To handle such cases, we query the position before and
+// after it, compare them, and clean the artifact if they don't match.
+//
+// Reference: https://ansicode.eversources.app/en/sequence/decrqm
+var startupQueries = []termQuery{offsetQuery, pasteModeQuery, offsetQuery}
 
 func (r *LightRenderer) Bell() {
 	r.flushRaw("\a")
@@ -39,6 +69,7 @@ func (r *LightRenderer) Bell() {
 
 func (r *LightRenderer) PassThrough(str string) {
 	r.queued.WriteString("\x1b7" + str + "\x1b8")
+	r.invalidateSGR()
 }
 
 func (r *LightRenderer) stderr(str string) {
@@ -49,13 +80,26 @@ const DIM string = "\x1b[2m"
 const CR string = DIM + "␍"
 const LF string = DIM + "␊"
 
+type getCharResult int
+
+const (
+	getCharSuccess getCharResult = iota
+	getCharError
+	getCharCancelled
+)
+
+func (r getCharResult) ok() bool {
+	return r == getCharSuccess
+}
+
 func (r *LightRenderer) stderrInternal(str string, allowNLCR bool, resetCode string) {
 	bytes := []byte(str)
 	runes := []rune{}
 	for len(bytes) > 0 {
 		r, sz := utf8.DecodeRune(bytes)
 		nlcr := r == '\n' || r == '\r'
-		if r >= 32 || r == '\x1b' || nlcr {
+		isC1 := r >= 0x80 && r <= 0x9F
+		if (r >= 32 && !isC1) || r == '\x1b' || nlcr {
 			if nlcr && !allowNLCR {
 				if r == '\r' {
 					runes = append(runes, []rune(CR+resetCode)...)
@@ -77,14 +121,36 @@ func (r *LightRenderer) csi(code string) string {
 	return fullcode
 }
 
+// setSGR emits the given SGR sequence only when the terminal is not already
+// in that state. Sequences built by csiColor start with a reset parameter,
+// so each of them fully determines the state on its own. The zero value of
+// r.sgr never matches a sequence, so the first update after Init, Resume, or
+// invalidateSGR is always emitted.
+func (r *LightRenderer) setSGR(code string) {
+	if code != r.sgr {
+		r.stderr(code)
+		r.sgr = code
+	}
+}
+
+// invalidateSGR marks the terminal SGR state as unknown, e.g. after raw
+// output that may have changed it behind the renderer's back.
+func (r *LightRenderer) invalidateSGR() {
+	r.sgr = ""
+}
+
 func (r *LightRenderer) flush() {
 	if r.queued.Len() > 0 {
-		raw := "\x1b[?7l\x1b[?25l" + r.queued.String()
+		// Leave the terminal in the default SGR state between frames
+		r.setSGR("\x1b[0m")
+		// Wrap the frame in synchronized update mode (2026) so that the
+		// terminal applies it atomically. Terminals without support ignore
+		// the unknown private mode and behave as before.
+		raw := "\x1b[?2026h\x1b[?7l\x1b[?25l" + r.queued.String()
 		if r.showCursor {
-			raw += "\x1b[?25h\x1b[?7h"
-		} else {
-			raw += "\x1b[?7h"
+			raw += "\x1b[?25h"
 		}
+		raw += "\x1b[?7h\x1b[?2026l"
 		r.flushRaw(raw)
 		r.queued.Reset()
 	}
@@ -104,6 +170,7 @@ type LightRenderer struct {
 	clicks        [][2]int
 	ttyin         *os.File
 	ttyout        *os.File
+	cancel        func()
 	buffer        []byte
 	origState     *term.State
 	width         int
@@ -114,13 +181,18 @@ type LightRenderer struct {
 	fullscreen    bool
 	upOneLine     bool
 	queued        strings.Builder
+	sgr           string
 	y             int
 	x             int
 	maxHeightFunc func(int) int
 	showCursor    bool
+	mutex         sync.Mutex
+
+	// Whether bracketed paste was already on before we enabled it. Nil when
+	// the terminal did not answer the query.
+	pasteWasSet *bool
 
 	// Windows only
-	mutex           sync.Mutex
 	ttyinChannel    chan byte
 	inHandle        uintptr
 	outHandle       uintptr
@@ -192,13 +264,13 @@ func (r *LightRenderer) Init() error {
 
 	if r.fullscreen {
 		r.smcup()
-	} else {
-		// We assume that --no-clear is used for repetitive relaunching of fzf.
-		// So we do not clear the lower bottom of the screen.
-		if r.clearOnExit {
-			r.csi("J")
-		}
-		y, x := r.findOffset()
+	}
+
+	// Ask everything in one round trip, before the offset is needed.
+	y, x, pasteWasSet := r.queryStartup()
+	r.pasteWasSet = pasteWasSet
+
+	if !r.fullscreen {
 		r.mouse = r.mouse && y >= 0
 		// When --no-clear is used for repetitive relaunching, there is a small
 		// time frame between fzf processes where the user keystrokes are not
@@ -207,6 +279,11 @@ func (r *LightRenderer) Init() error {
 		if x > 0 && r.clearOnExit {
 			r.upOneLine = true
 			r.makeSpace()
+		}
+		// We assume that --no-clear is used for repetitive relaunching of fzf.
+		// So we do not clear the lower bottom of the screen.
+		if r.clearOnExit {
+			r.csi("J")
 		}
 		for i := 1; i < r.MaxY(); i++ {
 			r.makeSpace()
@@ -218,7 +295,7 @@ func (r *LightRenderer) Init() error {
 	r.csi("G")
 	r.csi("K")
 	if !r.clearOnExit && !r.fullscreen {
-		r.csi("s")
+		r.stderr("\x1b7") // DECSC: save cursor position
 	}
 	if !r.fullscreen && r.mouse {
 		r.yoffset, _ = r.findOffset()
@@ -236,15 +313,15 @@ func (r *LightRenderer) makeSpace() {
 }
 
 func (r *LightRenderer) move(y int, x int) {
-	// w.csi("u")
 	if r.y < y {
 		r.csi(fmt.Sprintf("%dB", y-r.y))
 	} else if r.y > y {
 		r.csi(fmt.Sprintf("%dA", r.y-y))
 	}
-	r.stderr("\r")
-	if x > 0 {
-		r.csi(fmt.Sprintf("%dC", x))
+	if x == 0 {
+		r.stderr("\r")
+	} else {
+		r.csi(fmt.Sprintf("%dG", x+1))
 	}
 	r.y = y
 	r.x = x
@@ -262,28 +339,73 @@ func getEnv(name string, defaultValue int) int {
 	return atoi(env, defaultValue)
 }
 
-func (r *LightRenderer) getBytes() ([]byte, error) {
-	bytes, err := r.getBytesInternal(r.buffer, false)
-	return bytes, err
+// Bytes of a CSI sequence: parameter and intermediate bytes continue it, a
+// final byte ends it. Order is not enforced. Strictness would only make fzf
+// give up on a sequence it could have framed.
+//
+// https://vt100.net/emu/dec_ansi_parser
+func csiContinues(b byte) bool { return b >= 0x20 && b <= 0x3f }
+func csiFinal(b byte) bool     { return b >= 0x40 && b <= 0x7e }
+
+// incompleteEscape reports whether the buffer ends in an escape sequence that
+// has not been terminated yet. The read loop keeps waiting in that case, so the
+// parser is never handed a fragment to guess at.
+func incompleteEscape(buffer []byte) bool {
+	// Only the tail can hold a sequence still arriving. This runs once per byte
+	// read, so scanning all of a large paste would make the read quadratic.
+	tail := buffer
+	if len(tail) > escapeLookback {
+		tail = tail[len(tail)-escapeLookback:]
+	}
+	start := bytes.LastIndexByte(tail, Esc.Byte())
+	if start < 0 || len(tail)-start < 2 {
+		return false
+	}
+	switch tail[start+1] {
+	case '[':
+		for _, b := range tail[start+2:] {
+			if csiFinal(b) {
+				return false
+			}
+			if !csiContinues(b) {
+				return false // malformed, do not wait for a terminator
+			}
+		}
+		return true
+	case 'O':
+		return len(tail)-start < 3
+	}
+	return false
 }
 
-func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) ([]byte, error) {
-	c, ok := r.getch(nonblock)
-	if !nonblock && !ok {
+func (r *LightRenderer) getBytes(cancellable bool) ([]byte, getCharResult, error) {
+	return r.getBytesInternal(cancellable, r.buffer, false)
+}
+
+func (r *LightRenderer) getBytesInternal(cancellable bool, buffer []byte, nonblock bool) ([]byte, getCharResult, error) {
+	c, result := r.getch(cancellable, nonblock)
+	if result == getCharCancelled {
+		return buffer, getCharCancelled, nil
+	}
+	if !nonblock && !result.ok() {
 		r.Close()
-		return nil, errors.New("failed to read " + DefaultTtyDevice)
+		return nil, getCharError, errors.New("failed to read " + DefaultTtyDevice)
 	}
 
 	retries := 0
 	if c == Esc.Int() || nonblock {
 		retries = r.escDelay / escPollInterval
 	}
-	buffer = append(buffer, byte(c))
+	// A non-blocking read that found nothing has no byte to record. Recording
+	// one would put a NUL in the middle of a reply still being assembled.
+	if result.ok() {
+		buffer = append(buffer, byte(c))
+	}
 
 	pc := c
 	for {
-		c, ok = r.getch(true)
-		if !ok {
+		c, result = r.getch(false, true)
+		if !result.ok() {
 			if retries > 0 {
 				retries--
 				time.Sleep(escPollInterval * time.Millisecond)
@@ -296,25 +418,36 @@ func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) ([]byte, 
 			retries = 0
 		}
 		buffer = append(buffer, byte(c))
+		// Keep waiting while a sequence is still arriving. Dropping the budget
+		// after every byte left fzf parsing whatever the read happened to end on.
+		// Past the introducer this is not the ESC key, so the wait costs no
+		// Escape latency and ESCDELAY=0 must not reduce it to nothing.
+		if retries == 0 && incompleteEscape(buffer) {
+			retries = max(r.escDelay, defaultEscDelay) / escPollInterval
+		}
 		pc = c
 
 		// This should never happen under normal conditions,
 		// so terminate fzf immediately.
 		if len(buffer) > maxInputBuffer {
 			r.Close()
-			return nil, fmt.Errorf("input buffer overflow (%d): %v", len(buffer), buffer)
+			return nil, getCharError, fmt.Errorf("input buffer overflow (%d): %v", len(buffer), buffer)
 		}
 	}
 
-	return buffer, nil
+	return buffer, getCharSuccess, nil
 }
 
-func (r *LightRenderer) GetChar() Event {
+func (r *LightRenderer) GetChar(cancellable bool) Event {
 	var err error
+	var result getCharResult
 	if len(r.buffer) == 0 {
-		r.buffer, err = r.getBytes()
+		r.buffer, result, err = r.getBytes(cancellable)
 		if err != nil {
 			return Event{Fatal, 0, nil}
+		}
+		if result == getCharCancelled {
+			return Event{Invalid, 0, nil}
 		}
 	}
 	if len(r.buffer) == 0 {
@@ -351,9 +484,14 @@ func (r *LightRenderer) GetChar() Event {
 		ev := r.escSequence(&sz)
 		// Second chance
 		if ev.Type == Invalid {
-			if r.buffer, err = r.getBytes(); err != nil {
+			r.buffer, result, err = r.getBytes(true)
+			if err != nil {
 				return Event{Fatal, 0, nil}
 			}
+			if result == getCharCancelled {
+				return Event{Invalid, 0, nil}
+			}
+
 			ev = r.escSequence(&sz)
 		}
 		return ev
@@ -371,12 +509,33 @@ func (r *LightRenderer) GetChar() Event {
 	return Event{Rune, char, nil}
 }
 
+func (r *LightRenderer) CancelGetChar() {
+	r.mutex.Lock()
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+	r.mutex.Unlock()
+}
+
+func (r *LightRenderer) setCancel(f func()) {
+	r.mutex.Lock()
+	r.cancel = f
+	r.mutex.Unlock()
+}
+
 func (r *LightRenderer) escSequence(sz *int) Event {
 	if len(r.buffer) < 2 {
 		return Event{Esc, 0, nil}
 	}
 
 	loc := offsetRegexpBegin.FindIndex(r.buffer)
+	if loc != nil && loc[0] == 0 {
+		*sz = loc[1]
+		return Event{Invalid, 0, nil}
+	}
+
+	loc = pasteModeRegexpBegin.FindIndex(r.buffer)
 	if loc != nil && loc[0] == 0 {
 		*sz = loc[1]
 		return Event{Invalid, 0, nil}
@@ -650,6 +809,7 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 					switch r.buffer[4] {
 					case '1', '2', '3', '4', '5', '6', '7', '8', '9':
 						//                   Kitty      iTerm2     WezTerm
+						// ARROW             "\e[1;1D"
 						// SHIFT-ARROW       "\e[1;2D"
 						// ALT-SHIFT-ARROW   "\e[1;4D"  "\e[1;10D" "\e[1;4D"
 						// CTRL-SHIFT-ARROW  "\e[1;6D"             N/A
@@ -704,6 +864,7 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 							if shift {
 								return Event{ShiftUp, 0, nil}
 							}
+							return Event{Up, 0, nil}
 						case 'B':
 							if ctrlAltShift {
 								return Event{CtrlAltShiftDown, 0, nil}
@@ -726,6 +887,7 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 							if shift {
 								return Event{ShiftDown, 0, nil}
 							}
+							return Event{Down, 0, nil}
 						case 'C':
 							if ctrlAltShift {
 								return Event{CtrlAltShiftRight, 0, nil}
@@ -748,6 +910,7 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 							if alt {
 								return Event{AltRight, 0, nil}
 							}
+							return Event{Right, 0, nil}
 						case 'D':
 							if ctrlAltShift {
 								return Event{CtrlAltShiftLeft, 0, nil}
@@ -770,6 +933,7 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 							if shift {
 								return Event{ShiftLeft, 0, nil}
 							}
+							return Event{Left, 0, nil}
 						case 'H':
 							if ctrlAltShift {
 								return Event{CtrlAltShiftHome, 0, nil}
@@ -792,6 +956,7 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 							if shift {
 								return Event{ShiftHome, 0, nil}
 							}
+							return Event{Home, 0, nil}
 						case 'F':
 							if ctrlAltShift {
 								return Event{CtrlAltShiftEnd, 0, nil}
@@ -814,6 +979,7 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 							if shift {
 								return Event{ShiftEnd, 0, nil}
 							}
+							return Event{End, 0, nil}
 						}
 					} // r.buffer[4]
 				} // r.buffer[3]
@@ -858,12 +1024,15 @@ func (r *LightRenderer) mouseSequence(sz *int) Event {
 	down := rest[end] == 'M'
 
 	scroll := 0
-	if t >= 64 {
+	wheel := t >= 64
+	if wheel {
 		t -= 64
-		if t&0b1 == 1 {
-			scroll = -1
-		} else {
+		// SGR wheel button codes: 64=up, 65=down, 66=left, 67=right
+		switch t & 0b11 {
+		case 0:
 			scroll = 1
+		case 1:
+			scroll = -1
 		}
 	}
 
@@ -874,7 +1043,7 @@ func (r *LightRenderer) mouseSequence(sz *int) Event {
 	shift := t&0b00100 > 0
 	drag := t&0b100000 > 0 // 32
 
-	if scroll != 0 {
+	if wheel {
 		return Event{Mouse, 0, &MouseEvent{y, x, scroll, false, false, false, ctrl, alt, shift}}
 	}
 
@@ -945,11 +1114,23 @@ func (r *LightRenderer) disableMouse() {
 
 func (r *LightRenderer) disableModes() {
 	r.disableMouse()
-	r.csi("?2004l")
+	// Put bracketed paste back the way we found it. A shell that runs fzf from
+	// a line editor widget re-enables the mode only when the editor starts, so
+	// forcing it off here would leave it off for the rest of the session.
+	// Terminals that did not answer the query fall back to disabling, which is
+	// what fzf has always done.
+	if r.pasteWasSet != nil && *r.pasteWasSet {
+		r.csi("?2004h")
+	} else {
+		r.csi("?2004l")
+	}
 }
 
 func (r *LightRenderer) Resume(clear bool, sigcont bool) {
 	r.setupTerminal()
+	// The programs that ran in the meantime may have left the terminal in an
+	// arbitrary SGR state
+	r.invalidateSGR()
 	if clear {
 		if r.fullscreen {
 			r.smcup()
@@ -971,7 +1152,6 @@ func (r *LightRenderer) Clear() {
 	if r.fullscreen {
 		r.csi("H")
 	}
-	// r.csi("u")
 	r.origin()
 	r.csi("J")
 	r.flush()
@@ -994,7 +1174,6 @@ func (r *LightRenderer) Refresh() {
 }
 
 func (r *LightRenderer) Close() {
-	// r.csi("u")
 	if r.clearOnExit {
 		if r.fullscreen {
 			r.rmcup()
@@ -1006,7 +1185,7 @@ func (r *LightRenderer) Close() {
 			r.csi("J")
 		}
 	} else if !r.fullscreen {
-		r.csi("u")
+		r.stderr("\x1b8") // DECRC: restore cursor position
 	}
 	if !r.showCursor {
 		r.csi("?25h")
@@ -1083,131 +1262,144 @@ func (w *LightWindow) DrawHBorder() {
 	w.drawBorder(true)
 }
 
+// drawHLine fills row `row` with `line` between optional left/right caps.
+// A zero rune means "no cap"; caps are placed at the very edges of `w`.
+func (w *LightWindow) drawHLine(row int, line, leftCap, rightCap rune, color ColorPair) {
+	w.Move(row, 0)
+	hw := runeWidth(line)
+	width := w.width
+	if leftCap != 0 {
+		w.CPrint(color, string(leftCap))
+		width -= runeWidth(leftCap)
+	}
+	if rightCap != 0 {
+		width -= runeWidth(rightCap)
+	}
+	if width < 0 {
+		width = 0
+	}
+	inner := width / hw
+	rem := width - inner*hw
+	w.CPrint(color, repeat(line, inner)+repeat(' ', rem))
+	if rightCap != 0 {
+		w.CPrint(color, string(rightCap))
+	}
+}
+
+func (w *LightWindow) DrawHSeparator(row int, windowType WindowType, useBottom bool) {
+	if w.height == 0 {
+		return
+	}
+	shape := w.border.shape
+	if shape == BorderNone {
+		return
+	}
+	color := BorderColor(windowType)
+	line := w.border.top
+	if useBottom {
+		line = w.border.bottom
+	}
+	var leftCap, rightCap rune
+	if shape.HasLeft() {
+		leftCap = w.border.leftMid
+	}
+	if shape.HasRight() {
+		rightCap = w.border.rightMid
+	}
+	w.drawHLine(row, line, leftCap, rightCap, color)
+}
+
+func (w *LightWindow) PaintSectionFrame(topContent, bottomContent int, windowType WindowType, edge SectionEdge) {
+	if w.height == 0 || w.border.shape == BorderNone {
+		return
+	}
+	color := BorderColor(windowType)
+	shape := w.border.shape
+	hasLeft := shape.HasLeft()
+	hasRight := shape.HasRight()
+	rightW := runeWidth(w.border.right)
+	// Content rows: overpaint left/right verticals + their 1-char margin.
+	for row := topContent; row <= bottomContent; row++ {
+		if hasLeft {
+			w.Move(row, 0)
+			w.CPrint(color, string(w.border.left)+" ")
+		}
+		if hasRight {
+			w.Move(row, w.width-rightW-1)
+			w.CPrint(color, " "+string(w.border.right))
+		}
+	}
+	if edge == SectionEdgeTop && shape.HasTop() {
+		var leftCap, rightCap rune
+		if hasLeft {
+			leftCap = w.border.topLeft
+		}
+		if hasRight {
+			rightCap = w.border.topRight
+		}
+		w.drawHLine(0, w.border.top, leftCap, rightCap, color)
+	}
+	if edge == SectionEdgeBottom && shape.HasBottom() {
+		var leftCap, rightCap rune
+		if hasLeft {
+			leftCap = w.border.bottomLeft
+		}
+		if hasRight {
+			rightCap = w.border.bottomRight
+		}
+		w.drawHLine(w.height-1, w.border.bottom, leftCap, rightCap, color)
+	}
+}
+
 func (w *LightWindow) drawBorder(onlyHorizontal bool) {
 	if w.height == 0 {
 		return
 	}
-	switch w.border.shape {
-	case BorderRounded, BorderSharp, BorderBold, BorderBlock, BorderThinBlock, BorderDouble:
-		w.drawBorderAround(onlyHorizontal)
-	case BorderHorizontal:
-		w.drawBorderHorizontal(true, true)
-	case BorderVertical:
-		if onlyHorizontal {
-			return
-		}
-		w.drawBorderVertical(true, true)
-	case BorderTop:
-		w.drawBorderHorizontal(true, false)
-	case BorderBottom:
-		w.drawBorderHorizontal(false, true)
-	case BorderLeft:
-		if onlyHorizontal {
-			return
-		}
-		w.drawBorderVertical(true, false)
-	case BorderRight:
-		if onlyHorizontal {
-			return
-		}
-		w.drawBorderVertical(false, true)
+	shape := w.border.shape
+	if shape == BorderNone {
+		return
 	}
-}
+	color := BorderColor(w.windowType)
+	hasLeft := shape.HasLeft()
+	hasRight := shape.HasRight()
 
-func (w *LightWindow) drawBorderHorizontal(top, bottom bool) {
-	color := ColBorder
-	switch w.windowType {
-	case WindowList:
-		color = ColListBorder
-	case WindowInput:
-		color = ColInputBorder
-	case WindowHeader:
-		color = ColHeaderBorder
-	case WindowFooter:
-		color = ColFooterBorder
-	case WindowPreview:
-		color = ColPreviewBorder
-	}
-	hw := runeWidth(w.border.top)
-	if top {
-		w.Move(0, 0)
-		w.CPrint(color, repeat(w.border.top, w.width/hw))
-	}
-
-	if bottom {
-		w.Move(w.height-1, 0)
-		w.CPrint(color, repeat(w.border.bottom, w.width/hw))
-	}
-}
-
-func (w *LightWindow) drawBorderVertical(left, right bool) {
-	vw := runeWidth(w.border.left)
-	color := ColBorder
-	switch w.windowType {
-	case WindowList:
-		color = ColListBorder
-	case WindowInput:
-		color = ColInputBorder
-	case WindowHeader:
-		color = ColHeaderBorder
-	case WindowFooter:
-		color = ColFooterBorder
-	case WindowPreview:
-		color = ColPreviewBorder
-	}
-	for y := 0; y < w.height; y++ {
-		if left {
-			w.Move(y, 0)
-			w.CPrint(color, string(w.border.left))
-			w.CPrint(color, " ") // Margin
+	if shape.HasTop() {
+		var leftCap, rightCap rune
+		if hasLeft {
+			leftCap = w.border.topLeft
 		}
-		if right {
-			w.Move(y, w.width-vw-1)
-			w.CPrint(color, " ") // Margin
-			w.CPrint(color, string(w.border.right))
+		if hasRight {
+			rightCap = w.border.topRight
 		}
+		w.drawHLine(0, w.border.top, leftCap, rightCap, color)
 	}
-}
-
-func (w *LightWindow) drawBorderAround(onlyHorizontal bool) {
-	w.Move(0, 0)
-	color := ColBorder
-	switch w.windowType {
-	case WindowList:
-		color = ColListBorder
-	case WindowInput:
-		color = ColInputBorder
-	case WindowHeader:
-		color = ColHeaderBorder
-	case WindowFooter:
-		color = ColFooterBorder
-	case WindowPreview:
-		color = ColPreviewBorder
-	}
-	hw := runeWidth(w.border.top)
-	tcw := runeWidth(w.border.topLeft) + runeWidth(w.border.topRight)
-	bcw := runeWidth(w.border.bottomLeft) + runeWidth(w.border.bottomRight)
-	rem := (w.width - tcw) % hw
-	w.CPrint(color, string(w.border.topLeft)+repeat(w.border.top, (w.width-tcw)/hw)+repeat(' ', rem)+string(w.border.topRight))
-	if !onlyHorizontal {
+	if !onlyHorizontal && (hasLeft || hasRight) {
 		vw := runeWidth(w.border.left)
-		for y := 1; y < w.height-1; y++ {
-			w.Move(y, 0)
-			w.CPrint(color, string(w.border.left))
-			w.CPrint(color, " ") // Margin
-
-			w.Move(y, w.width-vw-1)
-			w.CPrint(color, " ") // Margin
-			w.CPrint(color, string(w.border.right))
+		for y := 0; y < w.height; y++ {
+			// Corner rows are already painted by drawHLine above / below.
+			if (y == 0 && shape.HasTop()) || (y == w.height-1 && shape.HasBottom()) {
+				continue
+			}
+			if hasLeft {
+				w.Move(y, 0)
+				w.CPrint(color, string(w.border.left)+" ")
+			}
+			if hasRight {
+				w.Move(y, w.width-vw-1)
+				w.CPrint(color, " "+string(w.border.right))
+			}
 		}
 	}
-	w.Move(w.height-1, 0)
-	rem = (w.width - bcw) % hw
-	w.CPrint(color, string(w.border.bottomLeft)+repeat(w.border.bottom, (w.width-bcw)/hw)+repeat(' ', rem)+string(w.border.bottomRight))
-}
-
-func (w *LightWindow) csi(code string) string {
-	return w.renderer.csi(code)
+	if shape.HasBottom() {
+		var leftCap, rightCap rune
+		if hasLeft {
+			leftCap = w.border.bottomLeft
+		}
+		if hasRight {
+			rightCap = w.border.bottomRight
+		}
+		w.drawHLine(w.height-1, w.border.bottom, leftCap, rightCap, color)
+	}
 }
 
 func (w *LightWindow) stderrInternal(str string, allowNLCR bool, resetCode string) {
@@ -1283,7 +1475,18 @@ func attrCodes(attr Attr) []string {
 		codes = append(codes, "3")
 	}
 	if (attr & Underline) > 0 {
-		codes = append(codes, "4")
+		switch attr.UnderlineStyle() {
+		case UlStyleDouble:
+			codes = append(codes, "4:2")
+		case UlStyleCurly:
+			codes = append(codes, "4:3")
+		case UlStyleDotted:
+			codes = append(codes, "4:4")
+		case UlStyleDashed:
+			codes = append(codes, "4:5")
+		default:
+			codes = append(codes, "4")
+		}
 	}
 	if (attr & Blink) > 0 {
 		codes = append(codes, "5")
@@ -1321,10 +1524,34 @@ func colorCodes(fg Color, bg Color) []string {
 	return codes
 }
 
-func (w *LightWindow) csiColor(fg Color, bg Color, attr Attr) (bool, string) {
+func ulColorCode(c Color) string {
+	if c == colDefault {
+		return ""
+	}
+	if c.is24() {
+		r := (c >> 16) & 0xff
+		g := (c >> 8) & 0xff
+		b := (c) & 0xff
+		return fmt.Sprintf("58;2;%d;%d;%d", r, g, b)
+	}
+	if c >= 0 && c < 256 {
+		return fmt.Sprintf("58;5;%d", c)
+	}
+	return ""
+}
+
+// csiColor builds the SGR sequence for the given colors and attributes
+// without emitting it. The sequence starts with a reset parameter, so it
+// fully determines the SGR state on its own.
+func (w *LightWindow) csiColor(fg Color, bg Color, ul Color, attr Attr) (bool, string) {
 	codes := append(attrCodes(attr), colorCodes(fg, bg)...)
-	code := w.csi(";" + strings.Join(codes, ";") + "m")
-	return len(codes) > 0, code
+	if ulCode := ulColorCode(ul); ulCode != "" {
+		codes = append(codes, ulCode)
+	}
+	if len(codes) == 0 {
+		return false, "\x1b[0m"
+	}
+	return true, "\x1b[;" + strings.Join(codes, ";") + "m"
 }
 
 func (w *LightWindow) Print(text string) {
@@ -1336,65 +1563,26 @@ func cleanse(str string) string {
 }
 
 func (w *LightWindow) CPrint(pair ColorPair, text string) {
-	_, code := w.csiColor(pair.Fg(), pair.Bg(), pair.Attr())
+	_, code := w.csiColor(pair.Fg(), pair.Bg(), pair.Ul(), pair.Attr())
+	w.renderer.setSGR(code)
 	w.stderrInternal(cleanse(text), false, code)
-	w.csi("0m")
 }
 
 func (w *LightWindow) cprint2(fg Color, bg Color, attr Attr, text string) {
-	hasColors, code := w.csiColor(fg, bg, attr)
-	if hasColors {
-		defer w.csi("0m")
-	}
+	_, code := w.csiColor(fg, bg, colDefault, attr)
+	w.renderer.setSGR(code)
 	w.stderrInternal(cleanse(text), false, code)
-}
-
-type wrappedLine struct {
-	text         string
-	displayWidth int
-}
-
-func wrapLine(input string, prefixLength int, initialMax int, tabstop int, wrapSignWidth int) []wrappedLine {
-	lines := []wrappedLine{}
-	width := 0
-	line := ""
-	gr := uniseg.NewGraphemes(input)
-	max := initialMax
-	for gr.Next() {
-		rs := gr.Runes()
-		str := string(rs)
-		var w int
-		if len(rs) == 1 && rs[0] == '\t' {
-			w = tabstop - (prefixLength+width)%tabstop
-			str = repeat(' ', w)
-		} else if rs[0] == '\r' {
-			w++
-		} else {
-			w = uniseg.StringWidth(str)
-		}
-		width += w
-
-		if prefixLength+width <= max {
-			line += str
-		} else {
-			lines = append(lines, wrappedLine{string(line), width - w})
-			line = str
-			prefixLength = 0
-			width = w
-			max = initialMax - wrapSignWidth
-		}
-	}
-	lines = append(lines, wrappedLine{string(line), width})
-	return lines
 }
 
 func (w *LightWindow) fill(str string, resetCode string) FillReturn {
 	allLines := strings.Split(str, "\n")
 	for i, line := range allLines {
-		lines := wrapLine(line, w.posx, w.width, w.tabstop, w.wrapSignWidth)
+		lines := WrapLine(line, w.posx, w.width, w.tabstop, w.wrapSignWidth)
 		for j, wl := range lines {
-			w.stderrInternal(wl.text, false, resetCode)
-			w.posx += wl.displayWidth
+			if w.posx < w.width {
+				w.stderrInternal(wl.Text, false, resetCode)
+				w.posx += wl.DisplayWidth
+			}
 
 			// Wrap line
 			if j < len(lines)-1 || i < len(allLines)-1 {
@@ -1403,7 +1591,7 @@ func (w *LightWindow) fill(str string, resetCode string) FillReturn {
 				}
 				w.MoveAndClear(w.posy, w.posx)
 				w.Move(w.posy+1, 0)
-				w.renderer.stderr(resetCode)
+				w.renderer.setSGR(resetCode)
 				if len(lines) > 1 {
 					sign := w.wrapSign
 					width := w.wrapSignWidth
@@ -1413,7 +1601,8 @@ func (w *LightWindow) fill(str string, resetCode string) FillReturn {
 						width = truncatedWidth
 					}
 					w.stderrInternal(DIM+sign, false, resetCode)
-					w.renderer.stderr(resetCode)
+					w.renderer.invalidateSGR()
+					w.renderer.setSGR(resetCode)
 					w.Move(w.posy, width)
 				}
 			}
@@ -1424,20 +1613,19 @@ func (w *LightWindow) fill(str string, resetCode string) FillReturn {
 			return FillSuspend
 		}
 		w.Move(w.posy+1, 0)
-		w.renderer.stderr(resetCode)
+		w.renderer.setSGR(resetCode)
 		return FillNextLine
 	}
 	return FillContinue
 }
 
 func (w *LightWindow) setBg() string {
-	if w.bg != colDefault {
-		_, code := w.csiColor(colDefault, w.bg, AttrRegular)
-		return code
-	}
-	// Should clear dim attribute after ␍ in the preview window
+	// The plain reset code for the default background is still required to
+	// clear the dim attribute after ␍ in the preview window
 	// e.g. printf "foo\rbar" | fzf --ansi --preview 'printf "foo\rbar"'
-	return "\x1b[m"
+	_, code := w.csiColor(colDefault, w.bg, colDefault, AttrRegular)
+	w.renderer.setSGR(code)
+	return code
 }
 
 func (w *LightWindow) LinkBegin(uri string, params string) {
@@ -1454,7 +1642,7 @@ func (w *LightWindow) Fill(text string) FillReturn {
 	return w.fill(text, code)
 }
 
-func (w *LightWindow) CFill(fg Color, bg Color, attr Attr, text string) FillReturn {
+func (w *LightWindow) CFill(fg Color, bg Color, ul Color, attr Attr, text string) FillReturn {
 	w.Move(w.posy, w.posx)
 	if fg == colDefault {
 		fg = w.fg
@@ -1462,8 +1650,8 @@ func (w *LightWindow) CFill(fg Color, bg Color, attr Attr, text string) FillRetu
 	if bg == colDefault {
 		bg = w.bg
 	}
-	if hasColors, resetCode := w.csiColor(fg, bg, attr); hasColors {
-		defer w.csi("0m")
+	if hasColors, resetCode := w.csiColor(fg, bg, ul, attr); hasColors {
+		w.renderer.setSGR(resetCode)
 		return w.fill(text, resetCode)
 	}
 	return w.fill(text, w.setBg())

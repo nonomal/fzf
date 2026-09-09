@@ -299,6 +299,39 @@ func TestBind(t *testing.T) {
 	check(tui.F1.AsEvent(), "", actAbort)
 }
 
+func TestParseEveryEvent(t *testing.T) {
+	pairs, _, err := parseKeyChords("every(2),every(0.5)", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pairs) != 2 {
+		t.Errorf("expected 2 distinct every events, got %d", len(pairs))
+	}
+	if pairs[(tui.Event{Type: tui.Every, Char: 2000})] != "every(2)" {
+		t.Errorf("every(2) not registered")
+	}
+	if pairs[(tui.Event{Type: tui.Every, Char: 500})] != "every(0.5)" {
+		t.Errorf("every(0.5) not registered")
+	}
+
+	// Floor at 0.01s -> 10ms
+	pairs, _, err = parseKeyChords("every(0.001)", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pairs[(tui.Event{Type: tui.Every, Char: 10})] != "every(0.001)" {
+		t.Errorf("every(0.001) should floor to 10ms")
+	}
+
+	// Reject zero, negatives, and overflow (>= 2^31 ms = ~24.85 days)
+	for _, bad := range []string{"every(0)", "every(-1)", "every(abc)", "every()", "every(2147484)"} {
+		if _, _, err := parseKeyChords(bad, ""); err == nil {
+			t.Errorf("%s should be rejected", bad)
+		}
+	}
+
+}
+
 func TestColorSpec(t *testing.T) {
 	var base *tui.ColorTheme
 	theme := tui.Dark256
@@ -448,6 +481,64 @@ func TestPreviewOpts(t *testing.T) {
 		opts.Preview.size.size == 70) {
 		t.Error(opts.Preview)
 	}
+
+	// wrap-word tests
+	opts = optsFor("--preview-window=wrap-word")
+	if !(opts.Preview.wrap == true && opts.Preview.wrapWord == true) {
+		t.Errorf("wrap-word: wrap=%v, wrapWord=%v", opts.Preview.wrap, opts.Preview.wrapWord)
+	}
+	opts = optsFor("--preview-window=wrap-word,nowrap")
+	if !(opts.Preview.wrap == false && opts.Preview.wrapWord == false) {
+		t.Errorf("wrap-word,nowrap: wrap=%v, wrapWord=%v", opts.Preview.wrap, opts.Preview.wrapWord)
+	}
+	opts = optsFor("--preview-window=wrap-word,wrap")
+	if !(opts.Preview.wrap == true && opts.Preview.wrapWord == false) {
+		t.Errorf("wrap-word,wrap: wrap=%v, wrapWord=%v", opts.Preview.wrap, opts.Preview.wrapWord)
+	}
+}
+
+func TestPreviewWrapSign(t *testing.T) {
+	// Default: no preview wrap sign override
+	opts := optsFor()
+	if opts.PreviewWrapSign != nil {
+		t.Errorf("expected nil PreviewWrapSign, got %v", *opts.PreviewWrapSign)
+	}
+
+	// --preview-wrap-sign sets PreviewWrapSign
+	opts = optsFor("--preview-wrap-sign", ">> ")
+	if opts.PreviewWrapSign == nil || *opts.PreviewWrapSign != ">> " {
+		t.Errorf("expected '>> ', got %v", opts.PreviewWrapSign)
+	}
+
+	// --preview-wrap-sign is independent of --wrap-sign
+	opts = optsFor("--wrap-sign", "| ", "--preview-wrap-sign", ">> ")
+	if opts.WrapSign == nil || *opts.WrapSign != "| " {
+		t.Errorf("expected WrapSign '| ', got %v", opts.WrapSign)
+	}
+	if opts.PreviewWrapSign == nil || *opts.PreviewWrapSign != ">> " {
+		t.Errorf("expected PreviewWrapSign '>> ', got %v", opts.PreviewWrapSign)
+	}
+
+	// --preview-wrap-sign without --wrap-sign
+	opts = optsFor("--preview-wrap-sign", "→ ")
+	if opts.WrapSign != nil {
+		t.Errorf("expected nil WrapSign, got %v", *opts.WrapSign)
+	}
+	if opts.PreviewWrapSign == nil || *opts.PreviewWrapSign != "→ " {
+		t.Errorf("expected PreviewWrapSign '→ ', got %v", opts.PreviewWrapSign)
+	}
+
+	// Last --preview-wrap-sign wins
+	opts = optsFor("--preview-wrap-sign", "A ", "--preview-wrap-sign", "B ")
+	if opts.PreviewWrapSign == nil || *opts.PreviewWrapSign != "B " {
+		t.Errorf("expected PreviewWrapSign 'B ', got %v", opts.PreviewWrapSign)
+	}
+
+	// Empty string is allowed
+	opts = optsFor("--preview-wrap-sign", "")
+	if opts.PreviewWrapSign == nil || *opts.PreviewWrapSign != "" {
+		t.Errorf("expected empty PreviewWrapSign, got %v", opts.PreviewWrapSign)
+	}
 }
 
 func TestAdditiveExpect(t *testing.T) {
@@ -481,7 +572,7 @@ func TestValidateSign(t *testing.T) {
 }
 
 func TestParseSingleActionList(t *testing.T) {
-	actions, _ := parseSingleActionList("Execute@foo+bar,baz@+up+up+reload:down+down")
+	actions, _ := parseSingleActionList("Execute@foo+bar,baz@+up+up+reload:down+down", false)
 	if len(actions) != 4 {
 		t.Errorf("Invalid number of actions parsed:%d", len(actions))
 	}
@@ -497,7 +588,7 @@ func TestParseSingleActionList(t *testing.T) {
 }
 
 func TestParseSingleActionListError(t *testing.T) {
-	_, err := parseSingleActionList("change-query(foobar)baz")
+	_, err := parseSingleActionList("change-query(foobar)baz", false)
 	if err == nil {
 		t.Errorf("Failed to detect error")
 	}

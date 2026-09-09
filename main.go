@@ -11,7 +11,7 @@ import (
 	"github.com/junegunn/fzf/src/protector"
 )
 
-var version = "0.67"
+var version = "0.74"
 var revision = "devel"
 
 //go:embed shell/key-bindings.bash
@@ -28,6 +28,15 @@ var zshCompletion []byte
 
 //go:embed shell/key-bindings.fish
 var fishKeyBindings []byte
+
+//go:embed shell/key-bindings.nu
+var nushellKeyBindings []byte
+
+//go:embed shell/completion.nu
+var nushellCompletion []byte
+
+//go:embed shell/completion.fish
+var fishCompletion []byte
 
 //go:embed man/man1/fzf.1
 var manPage []byte
@@ -65,7 +74,12 @@ func main() {
 	}
 	if options.Fish {
 		printScript("key-bindings.fish", fishKeyBindings)
-		fmt.Println("fzf_key_bindings")
+		printScript("completion.fish", fishCompletion)
+		return
+	}
+	if options.Nushell {
+		printScript("key-bindings.nu", nushellKeyBindings)
+		printScript("completion.nu", nushellCompletion)
 		return
 	}
 	if options.Help {

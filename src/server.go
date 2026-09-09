@@ -122,13 +122,12 @@ func startHttpServer(address listenAddress, actionChannel chan []*action, getHan
 		}
 	}
 
-	server := httpServer{
-		apiKey:        []byte(apiKey),
-		actionChannel: actionChannel,
-		getHandler:    getHandler,
-	}
-
 	go func() {
+		server := httpServer{
+			apiKey:        []byte(apiKey),
+			actionChannel: actionChannel,
+			getHandler:    getHandler,
+		}
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
@@ -154,7 +153,7 @@ func startHttpServer(address listenAddress, actionChannel chan []*action, getHan
 func (server *httpServer) handleHttpRequest(conn net.Conn) string {
 	contentLength := 0
 	apiKey := ""
-	body := ""
+	var bodyBuilder strings.Builder
 	answer := func(code string, message string) string {
 		message += "\n"
 		return code + fmt.Sprintf("Content-Length: %d%s", len(message), crlf+crlf+message)
@@ -176,30 +175,29 @@ func (server *httpServer) handleHttpRequest(conn net.Conn) string {
 			token := data[:found+len(crlf)]
 			return len(token), token, nil
 		}
-		if atEOF || len(body)+len(data) >= contentLength {
+		if atEOF || bodyBuilder.Len()+len(data) >= contentLength {
 			return 0, data, bufio.ErrFinalToken
 		}
 		return 0, nil, nil
 	})
 
 	section := 0
+	var getMatch []string
+Loop:
 	for scanner.Scan() {
 		text := scanner.Text()
 		switch section {
-		case 0:
-			getMatch := getRegex.FindStringSubmatch(text)
-			if len(getMatch) > 0 {
-				response := server.getHandler(parseGetParams(getMatch[1]))
-				if len(response) > 0 {
-					return good(response)
-				}
-				return answer(httpUnavailable+jsonContentType, `{"error":"timeout"}`)
-			} else if !strings.HasPrefix(text, "POST / HTTP") {
+		case 0: // Request line
+			getMatch = getRegex.FindStringSubmatch(text)
+			if len(getMatch) == 0 && !strings.HasPrefix(text, "POST / HTTP") {
 				return bad("invalid request method")
 			}
 			section++
-		case 1:
-			if text == crlf {
+		case 1: // Request headers
+			if text == crlf { // End of headers
+				if len(getMatch) > 0 {
+					break Loop
+				}
 				if contentLength == 0 {
 					return bad("content-length header missing")
 				}
@@ -219,8 +217,8 @@ func (server *httpServer) handleHttpRequest(conn net.Conn) string {
 					apiKey = strings.TrimSpace(pair[1])
 				}
 			}
-		case 2:
-			body += text
+		case 2: // Request body
+			bodyBuilder.WriteString(text)
 		}
 	}
 
@@ -228,12 +226,21 @@ func (server *httpServer) handleHttpRequest(conn net.Conn) string {
 		return unauthorized("invalid api key")
 	}
 
+	if len(getMatch) > 0 {
+		response := server.getHandler(parseGetParams(getMatch[1]))
+		if len(response) > 0 {
+			return good(response)
+		}
+		return answer(httpUnavailable+jsonContentType, `{"error":"timeout"}`)
+	}
+
+	body := bodyBuilder.String()
 	if len(body) < contentLength {
 		return bad("incomplete request")
 	}
 	body = body[:contentLength]
 
-	actions, err := parseSingleActionList(strings.Trim(string(body), "\r\n"))
+	actions, err := parseSingleActionList(strings.Trim(string(body), "\r\n"), false)
 	if err != nil {
 		return bad(err.Error())
 	}

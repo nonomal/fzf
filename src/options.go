@@ -4,11 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode"
+	"time"
 
 	"github.com/junegunn/fzf/src/algo"
 	"github.com/junegunn/fzf/src/tui"
@@ -65,7 +66,7 @@ Usage: fzf [options]
     --no-bold                Do not use bold text
 
   DISPLAY MODE
-    --height=[~]HEIGHT[%]    Display fzf window below the cursor with the given
+    --height=[~][-]HEIGHT[%] Display fzf window below the cursor with the given
                              height instead of using fullscreen.
                              A negative value is calculated as the terminal height
                              minus the given value.
@@ -74,16 +75,17 @@ Usage: fzf [options]
     --min-height=HEIGHT[+]   Minimum height when --height is given as a percentage.
                              Add '+' to automatically increase the value
                              according to the other layout options (default: 10+).
-    --tmux[=OPTS]            Start fzf in a tmux popup (requires tmux 3.3+)
+    --popup[=OPTS]           Start fzf in a floating pane (requires tmux 3.3+ or Zellij 0.44+)
                              [center|top|bottom|left|right][,SIZE[%]][,SIZE[%]]
                              [,border-native] (default: center,50%)
+    --tmux[=OPTS]            Alias for --popup
 
   LAYOUT
     --layout=LAYOUT          Choose layout: [default|reverse|reverse-list]
     --margin=MARGIN          Screen margin (TRBL | TB,RL | T,RL,B | T,R,B,L)
     --padding=PADDING        Padding inside border (TRBL | TB,RL | T,RL,B | T,R,B,L)
     --border[=STYLE]         Draw border around the finder
-                             [rounded|sharp|bold|block|thinblock|double|horizontal|vertical|
+                             [rounded|sharp|bold|block|thinblock|double|dashed|horizontal|vertical|
                               top|bottom|left|right|line|none] (default: rounded)
     --border-label=LABEL     Label to print on the border
     --border-label-pos=COL   Position of the border label
@@ -95,11 +97,12 @@ Usage: fzf [options]
     -m, --multi[=MAX]        Enable multi-select with tab/shift-tab
     --highlight-line         Highlight the whole current line
     --cycle                  Enable cyclic scroll
-    --wrap                   Enable line wrap
+    --wrap[=MODE]            Enable line wrap (char|word, default: char)
     --wrap-sign=STR          Indicator for wrapped lines
     --no-multi-line          Disable multi-line display of items when using --read0
     --raw                    Enable raw mode (show non-matching items)
     --track                  Track the current selection when the result is updated
+    --id-nth=N[,..]          Define item identity fields for cross-reload operations
     --tac                    Reverse the order of the input
     --gap[=N]                Render empty lines between each item
     --gap-line[=STR]         Draw horizontal line on each gap using the string
@@ -125,7 +128,7 @@ Usage: fzf [options]
                              (each for list section and preview window)
     --no-scrollbar           Hide scrollbar
     --list-border[=STYLE]    Draw border around the list section
-                             [rounded|sharp|bold|block|thinblock|double|horizontal|vertical|
+                             [rounded|sharp|bold|block|thinblock|double|dashed|horizontal|vertical|
                               top|bottom|left|right|none] (default: rounded)
     --list-label=LABEL       Label to print on the list border
     --list-label-pos=COL     Position of the list label
@@ -145,7 +148,7 @@ Usage: fzf [options]
     --ghost=TEXT             Ghost text to display when the input is empty
     --filepath-word          Make word-wise movements respect path separators
     --input-border[=STYLE]   Draw border around the input section
-                             [rounded|sharp|bold|block|thinblock|double|horizontal|vertical|
+                             [rounded|sharp|bold|block|thinblock|double|dashed|horizontal|vertical|
                               top|bottom|left|right|line|none] (default: rounded)
     --input-label=LABEL      Label to print on the input border
     --input-label-pos=COL    Position of the input label
@@ -156,28 +159,30 @@ Usage: fzf [options]
   PREVIEW WINDOW
     --preview=COMMAND        Command to preview highlighted line ({})
     --preview-window=OPT     Preview window layout (default: right:50%)
-                             [up|down|left|right][,SIZE[%]]
-                             [,[no]wrap][,[no]cycle][,[no]follow][,[no]info]
+                             [up|down|left|right|next][,SIZE[%]]
+                             [,[no]wrap[-word]][,[no]cycle][,[no]follow][,[no]info]
                              [,[no]hidden][,border-STYLE]
                              [,+SCROLL[OFFSETS][/DENOM]][,~HEADER_LINES]
                              [,default][,<SIZE_THRESHOLD(ALTERNATIVE_LAYOUT)]
     --preview-border[=STYLE] Short for --preview-window=border-STYLE
-                             [rounded|sharp|bold|block|thinblock|double|horizontal|vertical|
+                             [rounded|sharp|bold|block|thinblock|double|dashed|horizontal|vertical|
                               top|bottom|left|right|line|none] (default: rounded)
     --preview-label=LABEL
     --preview-label-pos=N    Same as --border-label and --border-label-pos,
                              but for preview window
+    --preview-wrap-sign=STR  Indicator for wrapped lines in the preview window
 
   HEADER
     --header=STR             String to print as header
     --header-lines=N         The first N lines of the input are treated as header
     --header-first           Print header before the prompt line
     --header-border[=STYLE]  Draw border around the header section
-                             [rounded|sharp|bold|block|thinblock|double|horizontal|vertical|
-                              top|bottom|left|right|line|none] (default: rounded)
+                             [rounded|sharp|bold|block|thinblock|double|dashed|horizontal|vertical|
+                              top|bottom|left|right|line|inline|none] (default: rounded)
     --header-lines-border[=STYLE]
                              Display header from --header-lines with a separate border.
                              Pass 'none' to still separate it but without a border.
+                             Pass 'inline' to embed it inside the list frame.
     --header-label=LABEL     Label to print on the header border
     --header-label-pos=COL   Position of the header label
                              [POSITIVE_INTEGER: columns from left|
@@ -187,8 +192,8 @@ Usage: fzf [options]
   FOOTER
     --footer=STR             String to print as footer
     --footer-border[=STYLE]  Draw border around the footer section
-                             [rounded|sharp|bold|block|thinblock|double|horizontal|vertical|
-                              top|bottom|left|right|line|none] (default: line)
+                             [rounded|sharp|bold|block|thinblock|double|dashed|horizontal|vertical|
+                              top|bottom|left|right|line|inline|none] (default: line)
     --footer-label=LABEL     Label to print on the footer border
     --footer-label-pos=COL   Position of the footer label
                              [POSITIVE_INTEGER: columns from left|
@@ -227,6 +232,7 @@ Usage: fzf [options]
     --bash                   Print script to set up Bash shell integration
     --zsh                    Print script to set up Zsh shell integration
     --fish                   Print script to set up Fish shell integration
+    --nushell                Print script to set up Nushell integration
 
   HELP
     --version                Display version information and exit
@@ -292,13 +298,31 @@ func defaultMargin() [4]sizeSpec {
 	return [4]sizeSpec{}
 }
 
-type trackOption int
+type trackOption struct {
+	enabled bool
+	index   int32
+}
 
-const (
-	trackDisabled trackOption = iota
-	trackEnabled
-	trackCurrent
+var (
+	trackDisabled = trackOption{false, minItem.Index()}
+	trackEnabled  = trackOption{true, minItem.Index()}
 )
+
+func (t trackOption) Disabled() bool {
+	return !t.enabled
+}
+
+func (t trackOption) Global() bool {
+	return t.enabled && t.index == minItem.Index()
+}
+
+func (t trackOption) Current() bool {
+	return t.enabled && t.index != minItem.Index()
+}
+
+func trackCurrent(index int32) trackOption {
+	return trackOption{true, index}
+}
 
 type windowPosition int
 
@@ -308,6 +332,7 @@ const (
 	posLeft
 	posRight
 	posCenter
+	posNext // adjacent to the input section, on the list side
 )
 
 type tmuxOptions struct {
@@ -349,6 +374,7 @@ type previewOpts struct {
 	scroll      string
 	hidden      bool
 	wrap        bool
+	wrapWord    bool
 	cycle       bool
 	follow      bool
 	info        bool
@@ -366,7 +392,7 @@ func (o *previewOpts) Toggle() {
 	o.hidden = !o.hidden
 }
 
-func (o *previewOpts) Border() tui.BorderShape {
+func (o *previewOpts) Border(layout layoutType) tui.BorderShape {
 	shape := o.border
 	if shape == tui.BorderLine {
 		switch o.position {
@@ -378,6 +404,12 @@ func (o *previewOpts) Border() tui.BorderShape {
 			shape = tui.BorderRight
 		case posRight:
 			shape = tui.BorderLeft
+		case posNext:
+			if layout == layoutReverse {
+				shape = tui.BorderBottom
+			} else {
+				shape = tui.BorderTop
+			}
 		}
 	}
 	return shape
@@ -395,7 +427,7 @@ func parseTmuxOptions(arg string, index int) (*tmuxOptions, error) {
 	var err error
 	opts := defaultTmuxOptions(index)
 	tokens := splitRegexp.Split(arg, -1)
-	errorToReturn := errors.New("invalid tmux option: " + arg + " (expected: [center|top|bottom|left|right][,SIZE[%]][,SIZE[%][,border-native]])")
+	errorToReturn := errors.New("invalid popup option: " + arg + " (expected: [center|top|bottom|left|right][,SIZE[%]][,SIZE[%]][,border-native])")
 	if len(tokens) == 0 || len(tokens) > 4 {
 		return nil, errorToReturn
 	}
@@ -487,7 +519,7 @@ func parseLabelPosition(opts *labelOpts, arg string) error {
 }
 
 func (a previewOpts) aboveOrBelow() bool {
-	return a.size.size > 0 && (a.position == posUp || a.position == posDown)
+	return a.size.size > 0 && (a.position == posUp || a.position == posDown || a.position == posNext)
 }
 
 type previewOptsCompare int
@@ -525,7 +557,7 @@ func (o *previewOpts) compare(active *previewOpts, b *previewOpts) previewOptsCo
 		return previewOptsDifferentLayout
 	}
 
-	if a.wrap == b.wrap && a.headerLines == b.headerLines && a.info == b.info && a.scroll == b.scroll {
+	if a.wrap == b.wrap && a.wrapWord == b.wrapWord && a.headerLines == b.headerLines && a.info == b.info && a.scroll == b.scroll {
 		return previewOptsSame
 	}
 
@@ -554,6 +586,7 @@ type Options struct {
 	Bash              bool
 	Zsh               bool
 	Fish              bool
+	Nushell           bool
 	Man               bool
 	Fuzzy             bool
 	FuzzyAlgo         algo.Algo
@@ -567,11 +600,13 @@ type Options struct {
 	FreezeLeft        int
 	FreezeRight       int
 	WithNth           func(Delimiter) func([]Token, int32) string
+	WithNthExpr       string
 	AcceptNth         func(Delimiter) func([]Token, int32) string
 	Delimiter         Delimiter
 	Sort              int
 	Raw               bool
 	Track             trackOption
+	IdNth             []Range
 	Tac               bool
 	Tail              int
 	Criteria          []criterion
@@ -587,7 +622,9 @@ type Options struct {
 	Layout            layoutType
 	Cycle             bool
 	Wrap              bool
+	WrapWord          bool
 	WrapSign          *string
+	PreviewWrapSign   *string
 	MultiLine         bool
 	CursorLine        bool
 	KeepRight         bool
@@ -655,6 +692,8 @@ type Options struct {
 	WalkerSkip        []string
 	Version           bool
 	Help              bool
+	Threads           int
+	Bench             time.Duration
 	CPUProfile        string
 	MEMProfile        string
 	BlockProfile      string
@@ -673,7 +712,13 @@ func filterNonEmpty(input []string) []string {
 }
 
 func defaultPreviewOpts(command string) previewOpts {
-	return previewOpts{command, posRight, sizeSpec{50, true}, "", false, false, false, false, true, defaultBorderShape, 0, 0, nil}
+	return previewOpts{
+		command:  command,
+		position: posRight,
+		size:     sizeSpec{50, true},
+		info:     true,
+		border:   defaultBorderShape,
+	}
 }
 
 func defaultOptions() *Options {
@@ -689,6 +734,7 @@ func defaultOptions() *Options {
 		Bash:         false,
 		Zsh:          false,
 		Fish:         false,
+		Nushell:      false,
 		Man:          false,
 		Fuzzy:        true,
 		FuzzyAlgo:    algo.FuzzyMatchV2,
@@ -715,6 +761,7 @@ func defaultOptions() *Options {
 		Layout:       layoutDefault,
 		Cycle:        false,
 		Wrap:         false,
+		WrapWord:     false,
 		MultiLine:    true,
 		KeepRight:    false,
 		Hscroll:      true,
@@ -834,7 +881,7 @@ func nthTransformer(str string) (func(Delimiter) func([]Token, int32) string, er
 		nth   []Range
 	}
 
-	parts := make([]NthParts, len(indexes))
+	parts := make([]NthParts, 0, len(indexes))
 	idx := 0
 	for _, index := range indexes {
 		if idx < index[0] {
@@ -917,6 +964,8 @@ func parseBorder(str string, optional bool) (tui.BorderShape, error) {
 	switch str {
 	case "line":
 		return tui.BorderLine, nil
+	case "inline":
+		return tui.BorderInline, nil
 	case "rounded":
 		return tui.BorderRounded, nil
 	case "sharp":
@@ -929,6 +978,8 @@ func parseBorder(str string, optional bool) (tui.BorderShape, error) {
 		return tui.BorderThinBlock, nil
 	case "double":
 		return tui.BorderDouble, nil
+	case "dashed":
+		return tui.BorderDashed, nil
 	case "horizontal":
 		return tui.BorderHorizontal, nil
 	case "vertical":
@@ -947,7 +998,7 @@ func parseBorder(str string, optional bool) (tui.BorderShape, error) {
 	if optional && str == "" {
 		return defaultBorderShape, nil
 	}
-	return tui.BorderNone, errors.New("invalid border style (expected: rounded|sharp|bold|block|thinblock|double|horizontal|vertical|top|bottom|left|right|none)")
+	return tui.BorderNone, errors.New("invalid border style (expected: rounded|sharp|bold|block|thinblock|double|dashed|horizontal|vertical|top|bottom|left|right|line|inline|none)")
 }
 
 func parseKeyChords(str string, message string) (map[tui.Event]string, []tui.Event, error) {
@@ -1012,6 +1063,8 @@ func parseKeyChords(str string, message string) (map[tui.Event]string, []tui.Eve
 			add(tui.Focus)
 		case "result":
 			add(tui.Result)
+		case "result-final":
+			add(tui.ResultFinal)
 		case "resize":
 			add(tui.Resize)
 		case "one":
@@ -1216,7 +1269,14 @@ func parseKeyChords(str string, message string) (map[tui.Event]string, []tui.Eve
 			add(tui.F12)
 		default:
 			runes := []rune(key)
-			if len(key) == 10 && strings.HasPrefix(lkey, "ctrl-alt-") && isAlphabet(lkey[9]) {
+			if strings.HasPrefix(lkey, "every(") && strings.HasSuffix(lkey, ")") {
+				evt, err := parseEveryEvent(key[6 : len(key)-1])
+				if err != nil {
+					return nil, list, err
+				}
+				chords[evt] = key
+				list = append(list, evt)
+			} else if len(key) == 10 && strings.HasPrefix(lkey, "ctrl-alt-") && isAlphabet(lkey[9]) {
 				r := rune(lkey[9])
 				evt := tui.CtrlAltKey(r)
 				if r == 'h' && !util.IsWindows() {
@@ -1256,6 +1316,21 @@ func parseKeyChords(str string, message string) (map[tui.Event]string, []tui.Eve
 		}
 	}
 	return chords, list, nil
+}
+
+func parseEveryEvent(arg string) (tui.Event, error) {
+	secs, err := strconv.ParseFloat(strings.TrimSpace(arg), 64)
+	if err != nil || math.IsNaN(secs) || math.IsInf(secs, 0) || secs <= 0 {
+		return tui.Event{}, errors.New("every() requires a positive number of seconds")
+	}
+	if secs < 0.01 {
+		secs = 0.01
+	}
+	ms := math.Round(secs * 1000)
+	if ms > math.MaxInt32 {
+		return tui.Event{}, errors.New("every() interval is too large")
+	}
+	return tui.Event{Type: tui.Every, Char: rune(int32(ms))}, nil
 }
 
 func parseScheme(str string) (string, []criterion, error) {
@@ -1389,6 +1464,14 @@ func parseTheme(defaultTheme *tui.ColorTheme, str string) (*tui.ColorTheme, *tui
 						cattr.Attr |= tui.Italic
 					case "underline":
 						cattr.Attr |= tui.Underline
+					case "underline-double":
+						cattr.Attr |= tui.Underline | tui.UlStyleDouble
+					case "underline-curly":
+						cattr.Attr |= tui.Underline | tui.UlStyleCurly
+					case "underline-dotted":
+						cattr.Attr |= tui.Underline | tui.UlStyleDotted
+					case "underline-dashed":
+						cattr.Attr |= tui.Underline | tui.UlStyleDashed
 					case "blink":
 						cattr.Attr |= tui.Blink
 					case "reverse":
@@ -1523,7 +1606,7 @@ func parseTheme(defaultTheme *tui.ColorTheme, str string) (*tui.ColorTheme, *tui
 			case "info":
 				mergeAttr(&theme.Info)
 			case "pointer":
-				mergeAttr(&theme.Cursor)
+				mergeAttr(&theme.Pointer)
 			case "marker":
 				mergeAttr(&theme.Marker)
 			case "header", "header-fg":
@@ -1569,7 +1652,7 @@ func parseWalkerOpts(str string) (walkerOpts, error) {
 }
 
 var (
-	executeRegexp    *regexp.Regexp
+	argActionRegexp  *regexp.Regexp
 	splitRegexp      *regexp.Regexp
 	actionNameRegexp *regexp.Regexp
 )
@@ -1588,8 +1671,8 @@ const (
 )
 
 func init() {
-	executeRegexp = regexp.MustCompile(
-		`(?si)[:+](become|execute(?:-multi|-silent)?|reload(?:-sync)?|preview|(?:change|bg-transform|transform)-(?:query|prompt|(?:border|list|preview|input|header|footer)-label|header|footer|search|nth|pointer|ghost)|bg-transform|transform|change-(?:preview-window|preview|multi)|(?:re|un|toggle-)bind|pos|put|print|search|trigger)`)
+	argActionRegexp = regexp.MustCompile(
+		`(?si)[:+](become|execute(?:-multi|-silent)?|reload(?:-sync)?|preview|(?:change|bg-transform|transform)-(?:query|prompt|(?:border|list|preview|input|header|footer)-label|header-lines|header|footer|search|with-nth|nth|pointer|ghost)|bg-transform|transform|change-(?:preview-window|preview|multi)|(?:re|un|toggle-)bind|pos|put|print|search|trigger)`)
 	splitRegexp = regexp.MustCompile("[,:]+")
 	actionNameRegexp = regexp.MustCompile("(?i)^[a-z-]+")
 }
@@ -1598,7 +1681,7 @@ func maskActionContents(action string) string {
 	masked := ""
 Loop:
 	for len(action) > 0 {
-		loc := executeRegexp.FindStringIndex(action)
+		loc := argActionRegexp.FindStringIndex(action)
 		if loc == nil {
 			masked += action
 			break
@@ -1652,10 +1735,10 @@ Loop:
 	return masked
 }
 
-func parseSingleActionList(str string) ([]*action, error) {
-	// We prepend a colon to satisfy executeRegexp and remove it later
+func parseSingleActionList(str string, putAllowed bool) ([]*action, error) {
+	// We prepend a colon to satisfy argActionRegexp and remove it later
 	masked := maskActionContents(":" + str)[1:]
-	return parseActionList(masked, str, []*action{}, false)
+	return parseActionList(masked, str, []*action{}, putAllowed)
 }
 
 func parseActionList(masked string, original string, prevActions []*action, putAllowed bool) ([]*action, error) {
@@ -1771,6 +1854,8 @@ func parseActionList(masked string, original string, prevActions []*action, putA
 			appendAction(actToggleHeader)
 		case "toggle-wrap":
 			appendAction(actToggleWrap)
+		case "toggle-wrap-word":
+			appendAction(actToggleWrapWord)
 		case "toggle-multi-line":
 			appendAction(actToggleMultiLine)
 		case "toggle-hscroll":
@@ -1837,6 +1922,8 @@ func parseActionList(masked string, original string, prevActions []*action, putA
 			appendAction(actTogglePreview)
 		case "toggle-preview-wrap":
 			appendAction(actTogglePreviewWrap)
+		case "toggle-preview-wrap-word":
+			appendAction(actTogglePreviewWrapWord)
 		case "toggle-sort":
 			appendAction(actToggleSort)
 		case "offset-up":
@@ -1871,6 +1958,8 @@ func parseActionList(masked string, original string, prevActions []*action, putA
 			} else {
 				return nil, errors.New("unable to put non-printable character")
 			}
+		case "wait":
+			appendAction(actWait)
 		case "bell":
 			appendAction(actBell)
 		case "exclude":
@@ -1957,8 +2046,7 @@ func parseKeymap(keymap map[tui.Event][]*action, str string) error {
 				}
 				key = firstKey(keys)
 			}
-			putAllowed := key.Type == tui.Rune && unicode.IsGraphic(key.Char)
-			keymap[key], err = parseActionList(pair[1], origPairStr[len(pair[0])+1:], keymap[key], putAllowed)
+			keymap[key], err = parseActionList(pair[1], origPairStr[len(pair[0])+1:], keymap[key], key.Printable())
 			if err != nil {
 				return err
 			}
@@ -1996,6 +2084,8 @@ func isExecuteAction(str string) actionType {
 		return actPreview
 	case "change-header":
 		return actChangeHeader
+	case "change-header-lines":
+		return actChangeHeaderLines
 	case "change-footer":
 		return actChangeFooter
 	case "change-list-label":
@@ -2026,6 +2116,8 @@ func isExecuteAction(str string) actionType {
 		return actChangeMulti
 	case "change-nth":
 		return actChangeNth
+	case "change-with-nth":
+		return actChangeWithNth
 	case "pos":
 		return actPosition
 	case "execute":
@@ -2056,10 +2148,14 @@ func isExecuteAction(str string) actionType {
 		return actTransformFooter
 	case "transform-header":
 		return actTransformHeader
+	case "transform-header-lines":
+		return actTransformHeaderLines
 	case "transform-ghost":
 		return actTransformGhost
 	case "transform-nth":
 		return actTransformNth
+	case "transform-with-nth":
+		return actTransformWithNth
 	case "transform-pointer":
 		return actTransformPointer
 	case "transform-prompt":
@@ -2086,10 +2182,14 @@ func isExecuteAction(str string) actionType {
 		return actBgTransformFooter
 	case "bg-transform-header":
 		return actBgTransformHeader
+	case "bg-transform-header-lines":
+		return actBgTransformHeaderLines
 	case "bg-transform-ghost":
 		return actBgTransformGhost
 	case "bg-transform-nth":
 		return actBgTransformNth
+	case "bg-transform-with-nth":
+		return actBgTransformWithNth
 	case "bg-transform-pointer":
 		return actBgTransformPointer
 	case "bg-transform-prompt":
@@ -2162,9 +2262,6 @@ func parseHeight(str string, index int) (heightSpec, error) {
 		str = str[1:]
 	}
 	if strings.HasPrefix(str, "-") {
-		if heightSpec.auto {
-			return heightSpec, errors.New("negative(-) height is not compatible with adaptive(~) height")
-		}
 		heightSpec.inverse = true
 		str = str[1:]
 	}
@@ -2248,8 +2345,13 @@ func parsePreviewWindowImpl(opts *previewOpts, input string) error {
 			opts.hidden = false
 		case "wrap":
 			opts.wrap = true
+			opts.wrapWord = false
+		case "wrap-word":
+			opts.wrap = true
+			opts.wrapWord = true
 		case "nowrap":
 			opts.wrap = false
+			opts.wrapWord = false
 		case "cycle":
 			opts.cycle = true
 		case "nocycle":
@@ -2262,6 +2364,8 @@ func parsePreviewWindowImpl(opts *previewOpts, input string) error {
 			opts.position = posLeft
 		case "right":
 			opts.position = posRight
+		case "next":
+			opts.position = posNext
 		case "rounded", "border", "border-rounded":
 			opts.border = tui.BorderRounded
 		case "border-line":
@@ -2276,6 +2380,8 @@ func parsePreviewWindowImpl(opts *previewOpts, input string) error {
 			opts.border = tui.BorderThinBlock
 		case "border-double":
 			opts.border = tui.BorderDouble
+		case "border-dashed":
+			opts.border = tui.BorderDashed
 		case "noborder", "border-none":
 			opts.border = tui.BorderNone
 		case "border-horizontal":
@@ -2452,6 +2558,7 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 		opts.Bash = false
 		opts.Zsh = false
 		opts.Fish = false
+		opts.Nushell = false
 		opts.Help = false
 		opts.Version = false
 		opts.Man = false
@@ -2564,6 +2671,9 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 		case "--fish":
 			clearExitingOpts()
 			opts.Fish = true
+		case "--nushell":
+			clearExitingOpts()
+			opts.Nushell = true
 		case "-h", "--help":
 			clearExitingOpts()
 			opts.Help = true
@@ -2572,7 +2682,7 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 			opts.Version = true
 		case "--no-winpty":
 			opts.NoWinpty = true
-		case "--tmux":
+		case "--tmux", "--popup":
 			given, str := optionalNextString()
 			if given {
 				if opts.Tmux, err = parseTmuxOptions(str, index); err != nil {
@@ -2581,7 +2691,7 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 			} else {
 				opts.Tmux = defaultTmuxOptions(index)
 			}
-		case "--no-tmux":
+		case "--no-tmux", "--no-popup":
 			opts.Tmux = nil
 		case "--tty-default":
 			if opts.TtyDefault, err = nextString("tty device name required"); err != nil {
@@ -2726,6 +2836,7 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 			if opts.WithNth, err = nthTransformer(str); err != nil {
 				return err
 			}
+			opts.WithNthExpr = str
 		case "--accept-nth":
 			str, err := nextString("nth expression required")
 			if err != nil {
@@ -2748,6 +2859,16 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 			opts.Track = trackEnabled
 		case "--no-track":
 			opts.Track = trackDisabled
+		case "--id-nth":
+			str, err := nextString("nth expression required")
+			if err != nil {
+				return err
+			}
+			if opts.IdNth, err = splitNth(str); err != nil {
+				return err
+			}
+		case "--no-id-nth":
+			opts.IdNth = nil
 		case "--tac":
 			opts.Tac = true
 		case "--no-tac":
@@ -2813,9 +2934,29 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 		case "--no-cycle":
 			opts.Cycle = false
 		case "--wrap":
-			opts.Wrap = true
+			given, str := optionalNextString()
+			if given {
+				switch str {
+				case "char":
+					opts.Wrap = true
+					opts.WrapWord = false
+				case "word":
+					opts.Wrap = true
+					opts.WrapWord = true
+				default:
+					return errors.New("invalid wrap mode: " + str + " (expected: char or word)")
+				}
+			} else {
+				opts.Wrap = true
+			}
 		case "--no-wrap":
 			opts.Wrap = false
+			opts.WrapWord = false
+		case "--wrap-word":
+			opts.Wrap = true
+			opts.WrapWord = true
+		case "--no-wrap-word":
+			opts.WrapWord = false
 		case "--wrap-sign":
 			str, err := nextString("wrap sign required")
 			if err != nil {
@@ -3035,7 +3176,7 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 		case "--no-preview":
 			opts.Preview.command = ""
 		case "--preview-window":
-			str, err := nextString("preview window layout required: [up|down|left|right][,SIZE[%]][,border-STYLE][,wrap][,cycle][,hidden][,+SCROLL[OFFSETS][/DENOM]][,~HEADER_LINES][,default]")
+			str, err := nextString("preview window layout required: [up|down|left|right|next][,SIZE[%]][,border-STYLE][,wrap][,cycle][,hidden][,+SCROLL[OFFSETS][/DENOM]][,~HEADER_LINES][,default]")
 			if err != nil {
 				return err
 			}
@@ -3049,8 +3190,14 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 			if opts.Preview.border, err = parseBorder(arg, !hasArg); err != nil {
 				return err
 			}
+		case "--preview-wrap-sign":
+			str, err := nextString("preview wrap sign required")
+			if err != nil {
+				return err
+			}
+			opts.PreviewWrapSign = &str
 		case "--height":
-			str, err := nextString("height required: [~]HEIGHT[%]")
+			str, err := nextString("height required: [~][-]HEIGHT[%]")
 			if err != nil {
 				return err
 			}
@@ -3295,6 +3442,23 @@ func parseOptions(index *int, opts *Options, allArgs []string) error {
 				return err
 			}
 			opts.WalkerSkip = filterNonEmpty(strings.Split(str, ","))
+		case "--threads":
+			if opts.Threads, err = nextInt("number of threads required"); err != nil {
+				return err
+			}
+			if opts.Threads < 0 {
+				return errors.New("--threads must be a positive integer")
+			}
+		case "--bench":
+			str, err := nextString("duration required (e.g. 3s, 500ms)")
+			if err != nil {
+				return err
+			}
+			dur, err := time.ParseDuration(str)
+			if err != nil {
+				return errors.New("invalid duration for --bench: " + str)
+			}
+			opts.Bench = dur
 		case "--profile-cpu":
 			if opts.CPUProfile, err = nextString("file path required: cpu"); err != nil {
 				return err
@@ -3400,7 +3564,9 @@ func applyPreset(opts *Options, preset string) error {
 		opts.Preview.border = tui.BorderLine
 		opts.Preview.info = false
 		opts.InfoStyle = infoDefault
-		opts.Theme.Gutter = tui.ColorAttr{Color: -1, Attr: 0}
+		opts.Theme.Gutter = tui.NewColorAttr()
+		space := " "
+		opts.Gutter = &space
 		empty := ""
 		opts.Separator = &empty
 		opts.Scrollbar = &empty
@@ -3475,7 +3641,7 @@ func validateOptions(opts *Options) error {
 		}
 	}
 
-	if opts.Height.auto {
+	if opts.Height.auto && (opts.Tmux == nil || opts.Tmux.index < opts.Height.index) {
 		for _, s := range []sizeSpec{opts.Margin[0], opts.Margin[2]} {
 			if s.percent {
 				return errors.New("adaptive height is not compatible with top/bottom percent margin")
@@ -3490,6 +3656,19 @@ func validateOptions(opts *Options) error {
 
 	if opts.Theme.Nth.IsColorDefined() {
 		return errors.New("only ANSI attributes are allowed for 'nth' (regular, bold, underline, reverse, dim, italic, strikethrough)")
+	}
+
+	if opts.BorderShape == tui.BorderInline ||
+		opts.ListBorderShape == tui.BorderInline ||
+		opts.InputBorderShape == tui.BorderInline ||
+		opts.Preview.border == tui.BorderInline {
+		return errors.New("inline border is only supported for --header-border, --header-lines-border, and --footer-border")
+	}
+	if opts.HeaderBorderShape == tui.BorderInline &&
+		opts.HeaderLinesShape != tui.BorderInline &&
+		opts.HeaderLinesShape != tui.BorderUndefined &&
+		opts.HeaderLinesShape != tui.BorderNone {
+		return errors.New("--header-border=inline requires --header-lines-border to be inline or unset")
 	}
 
 	return nil
@@ -3509,11 +3688,18 @@ func (opts *Options) useTmux() bool {
 	return opts.Tmux != nil && len(os.Getenv("TMUX")) > 0 && opts.Tmux.index >= opts.Height.index
 }
 
+func (opts *Options) useZellij() bool {
+	return opts.Tmux != nil && len(os.Getenv("ZELLIJ")) > 0 && opts.Tmux.index >= opts.Height.index
+}
+
 func (opts *Options) noSeparatorLine() bool {
 	if opts.Inputless {
 		return true
 	}
-	sep := opts.Separator == nil && !opts.InputBorderShape.Visible() || opts.Separator != nil && len(*opts.Separator) > 0
+	// NOTE: This does not know that the default separator can be suppressed at
+	// runtime (see Terminal.separatorLength), so the minimum heights derived
+	// from it can be one line taller than strictly necessary.
+	sep := opts.Separator == nil && !inputBorderFacesList(opts.Layout, opts.InputBorderShape) || opts.Separator != nil && len(*opts.Separator) > 0
 	return noSeparatorLine(opts.InfoStyle, sep)
 }
 
